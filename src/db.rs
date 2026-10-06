@@ -1,0 +1,176 @@
+//! Database - sqlx `Any` pool (MySQL / PostgreSQL / SQLite). Port of Database.php.
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
+
+use serde_json::{json, Map, Value};
+use sqlx::{any::AnyPoolOptions, AnyPool, Column, Row};
+
+use crate::{env, error::ApiError};
+
+static POOL: OnceLock<AnyPool> = OnceLock::new();
+static POSTGRES: OnceLock<bool> = OnceLock::new();
+static SQLITE: OnceLock<bool> = OnceLock::new();
+static QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// A bindable SQL value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl From<&str> for Val { fn from(v: &str) -> Self { Val::Str(v.into()) } }
+impl From<String> for Val { fn from(v: String) -> Self { Val::Str(v) } }
+impl From<i64> for Val { fn from(v: i64) -> Self { Val::Int(v) } }
+impl From<i32> for Val { fn from(v: i32) -> Self { Val::Int(v as i64) } }
+impl From<u32> for Val { fn from(v: u32) -> Self { Val::Int(v as i64) } }
+impl From<f64> for Val { fn from(v: f64) -> Self { Val::Float(v) } }
+impl From<bool> for Val { fn from(v: bool) -> Self { Val::Bool(v) } }
+impl<T: Into<Val>> From<Option<T>> for Val {
+    fn from(v: Option<T>) -> Self { v.map(Into::into).unwrap_or(Val::Null) }
+}
+
+impl From<&Value> for Val {
+    fn from(v: &Value) -> Self {
+        match v {
+            Value::Null => Val::Null,
+            Value::Bool(b) => Val::Bool(*b),
+            Value::Number(n) => n.as_i64().map(Val::Int).unwrap_or_else(|| Val::Float(n.as_f64().unwrap_or(0.0))),
+            Value::String(s) => Val::Str(s.clone()),
+            other => Val::Str(other.to_string()),
+        }
+    }
+}
+impl From<Value> for Val { fn from(v: Value) -> Self { (&v).into() } }
+
+pub struct Database;
+
+impl Database {
+    /// Connect using DATABASE_URL (or build one from DB_* variables).
+    pub async fn connect() -> Result<(), ApiError> {
+        sqlx::any::install_default_drivers();
+        let url = Self::url();
+        let _ = POSTGRES.set(url.starts_with("postgres"));
+        let _ = SQLITE.set(url.starts_with("sqlite"));
+        let pool = AnyPoolOptions::new()
+            .max_connections(env::get_int("DB_MAX_CONNECTIONS", 10) as u32)
+            .connect(&url)
+            .await?;
+        let _ = POOL.set(pool);
+        Ok(())
+    }
+
+    fn url() -> String {
+        if let Some(u) = env::get("DATABASE_URL") {
+            return u;
+        }
+        let driver = env::get_or("DB_DRIVER", "sqlite");
+        if driver == "sqlite" {
+            return format!("sqlite://{}?mode=rwc", env::get_or("DB_DATABASE", "database/app.db"));
+        }
+        format!(
+            "{}://{}:{}@{}:{}/{}",
+            if driver == "pgsql" { "postgres" } else { "mysql" },
+            env::get_or("DB_USERNAME", "root"),
+            env::get_or("DB_PASSWORD", ""),
+            env::get_or("DB_HOST", "127.0.0.1"),
+            env::get_or("DB_PORT", if driver == "pgsql" { "5432" } else { "3306" }),
+            env::get_or("DB_DATABASE", "padi"),
+        )
+    }
+
+    pub fn pool() -> Result<&'static AnyPool, ApiError> {
+        POOL.get().ok_or_else(|| ApiError::internal("Database not connected"))
+    }
+
+    pub fn is_postgres() -> bool {
+        *POSTGRES.get().unwrap_or(&false)
+    }
+
+    pub fn is_sqlite() -> bool {
+        *SQLITE.get().unwrap_or(&false)
+    }
+
+    pub fn query_count() -> u64 {
+        QUERY_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Rewrite `?` placeholders to `$n` for PostgreSQL.
+    fn prepare(sql: &str) -> String {
+        if !Self::is_postgres() {
+            return sql.to_string();
+        }
+        let mut out = String::with_capacity(sql.len() + 8);
+        let mut n = 0;
+        for c in sql.chars() {
+            if c == '?' {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn bind_all<'q>(
+        sql: &'q str,
+        params: &'q [Val],
+    ) -> sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>> {
+        let mut q = sqlx::query(sql);
+        for p in params {
+            q = match p {
+                Val::Null => q.bind(Option::<String>::None),
+                Val::Bool(b) => q.bind(*b),
+                Val::Int(i) => q.bind(*i),
+                Val::Float(f) => q.bind(*f),
+                Val::Str(s) => q.bind(s.as_str()),
+            };
+        }
+        q
+    }
+
+    pub async fn fetch_all(sql: &str, params: &[Val]) -> Result<Vec<Value>, ApiError> {
+        let sql = Self::prepare(sql);
+        QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+        let rows = Self::bind_all(&sql, params).fetch_all(Self::pool()?).await?;
+        Ok(rows.iter().map(row_to_json).collect())
+    }
+
+    pub async fn fetch_one(sql: &str, params: &[Val]) -> Result<Option<Value>, ApiError> {
+        Ok(Self::fetch_all(sql, params).await?.into_iter().next())
+    }
+
+    /// Returns (rows_affected, last_insert_id when the driver supports it).
+    pub async fn execute(sql: &str, params: &[Val]) -> Result<(u64, Option<i64>), ApiError> {
+        let sql = Self::prepare(sql);
+        QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+        let r = Self::bind_all(&sql, params).execute(Self::pool()?).await?;
+        Ok((r.rows_affected(), r.last_insert_id()))
+    }
+}
+
+fn row_to_json(row: &sqlx::any::AnyRow) -> Value {
+    let mut map = Map::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let v = if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+            v.map(|x| json!(x))
+        } else {
+            None
+        };
+        map.insert(col.name().to_string(), v.unwrap_or(Value::Null));
+    }
+    Value::Object(map)
+}
