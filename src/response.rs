@@ -1,14 +1,55 @@
-//! Response formatting (port of Router::formatResponse / Response.php).
+//! Response handling and formatting (port of Response.php & Router::formatResponse).
+//!
+//! Provides both idiomatic Axum response constructors (`ok`, `created`, `no_content`,
+//! `ApiResponse`, `ApiResult`) and the full-featured builder `Response` / `ResponseBuilder`
+//! matching PHP `Response.php`:
+//! - `json(data, status)`
+//! - `text(data, status)`
+//! - `html(data, status)`
+//! - `download(file_path, filename)`
+//! - `redirect(url, status)`
+//! - `header(key, value)` & `status(code)`
+//! - `status_text(code)` (matching PHP `getStatusText`)
+
+use std::collections::HashMap;
+
 use axum::{
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    body::Body,
+    http::{header, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response as AxumResponse},
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{env, error::ApiError};
 
 pub type ApiResult = Result<ApiResponse, ApiError>;
 
+/// Get HTTP status text matching PHP Response::getStatusText($code).
+pub fn status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown Status",
+    }
+}
+
+/// Get standardized UPPERCASE error/status code name (e.g. "VALIDATION_FAILED").
 pub fn status_code_name(code: u16) -> &'static str {
     match code {
         201 => "CREATED",
@@ -28,18 +69,20 @@ pub fn status_code_name(code: u16) -> &'static str {
     }
 }
 
-/// A successful handler result. Formatted by RESPONSE_FORMAT: full | simple | raw.
+/// A successful handler result. Formatted according to RESPONSE_FORMAT env: full | simple | raw.
+#[derive(Debug, Clone)]
 pub struct ApiResponse {
     pub status: u16,
     pub data: Value,
     pub message: String,
+    pub headers: HashMap<String, String>,
 }
 
-pub fn ok(data: impl serde::Serialize) -> ApiResult {
+pub fn ok(data: impl Serialize) -> ApiResult {
     Ok(ApiResponse::new(200, data))
 }
 
-pub fn created(data: impl serde::Serialize) -> ApiResult {
+pub fn created(data: impl Serialize) -> ApiResult {
     Ok(ApiResponse::new(201, data))
 }
 
@@ -48,16 +91,22 @@ pub fn no_content() -> ApiResult {
 }
 
 impl ApiResponse {
-    pub fn new(status: u16, data: impl serde::Serialize) -> Self {
+    pub fn new(status: u16, data: impl Serialize) -> Self {
         Self {
             status,
             data: serde_json::to_value(data).unwrap_or(Value::Null),
             message: "Success".into(),
+            headers: HashMap::new(),
         }
     }
 
     pub fn message(mut self, m: impl Into<String>) -> Self {
         self.message = m.into();
+        self
+    }
+
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
         self
     }
 }
@@ -99,7 +148,8 @@ fn format_body(r: &ApiResponse) -> Value {
     }
 }
 
-pub fn json_response(status: u16, body: &Value) -> Response {
+/// Generate Axum Response with JSON body and proper Content-Type headers.
+pub fn json_response(status: u16, body: &Value) -> AxumResponse {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     if status == 204 {
         return code.into_response();
@@ -109,7 +159,10 @@ pub fn json_response(status: u16, body: &Value) -> Response {
     } else {
         serde_json::to_vec(body)
     }
-    .unwrap_or_else(|_| b"{\"success\":false,\"message\":\"Response encoding error\",\"message_code\":\"ENCODING_ERROR\"}".to_vec());
+    .unwrap_or_else(|_| {
+        b"{\"success\":false,\"message\":\"Response encoding error\",\"message_code\":\"ENCODING_ERROR\"}".to_vec()
+    });
+
     let mut res = (code, bytes).into_response();
     res.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -119,7 +172,221 @@ pub fn json_response(status: u16, body: &Value) -> Response {
 }
 
 impl IntoResponse for ApiResponse {
-    fn into_response(self) -> Response {
-        json_response(self.status, &format_body(&self))
+    fn into_response(self) -> AxumResponse {
+        let mut res = json_response(self.status, &format_body(&self));
+        for (k, v) in self.headers {
+            if let (Ok(hname), Ok(hval)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
+                res.headers_mut().insert(hname, hval);
+            }
+        }
+        res
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Response Builder matching PHP Response.php API
+// -----------------------------------------------------------------------------
+
+/// Response builder mimicking PHP's `Response` instance methods.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseBuilder {
+    status_code: u16,
+    headers: HashMap<String, String>,
+}
+
+/// Type alias for PHP parity (`Response::json(...)`, `Response::text(...)`, etc.).
+pub type Response = ResponseBuilder;
+
+impl ResponseBuilder {
+    pub fn new() -> Self {
+        Self {
+            status_code: 200,
+            headers: HashMap::new(),
+        }
+    }
+
+    /// Set response header (PHP `$response->header($key, $value)`).
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set HTTP status code (PHP `$response->status($code)`).
+    pub fn status(mut self, code: u16) -> Self {
+        self.status_code = code;
+        self
+    }
+
+    /// Build JSON response (PHP `$response->json($data, $statusCode)`).
+    pub fn json(self, data: impl Serialize, status_code: Option<u16>) -> AxumResponse {
+        let code = status_code.unwrap_or(self.status_code);
+        let val = serde_json::to_value(data).unwrap_or(Value::Null);
+        let mut res = json_response(code, &val);
+        self.apply_headers(&mut res);
+        res
+    }
+
+    /// Static helper for immediate JSON response (`Response::json_data(data, code)`).
+    pub fn json_data(data: impl Serialize, code: u16) -> AxumResponse {
+        Self::new().status(code).json(data, Some(code))
+    }
+
+    /// Build plain text response (PHP `$response->text($data, $code)`).
+    pub fn text(self, data: impl Into<String>, code: Option<u16>) -> AxumResponse {
+        let status = StatusCode::from_u16(code.unwrap_or(self.status_code))
+            .unwrap_or(StatusCode::OK);
+        let text_content = data.into();
+        let mut res = (status, text_content).into_response();
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        self.apply_headers(&mut res);
+        res
+    }
+
+    /// Static helper for text response.
+    pub fn text_data(data: impl Into<String>, code: u16) -> AxumResponse {
+        Self::new().text(data, Some(code))
+    }
+
+    /// Build HTML response (PHP `$response->html($data, $code)`).
+    pub fn html(self, data: impl Into<String>, code: Option<u16>) -> AxumResponse {
+        let status = StatusCode::from_u16(code.unwrap_or(self.status_code))
+            .unwrap_or(StatusCode::OK);
+        let html_content = data.into();
+        let mut res = (status, axum::response::Html(html_content)).into_response();
+        self.apply_headers(&mut res);
+        res
+    }
+
+    /// Send file download (PHP `$response->download($filePath, $filename)`).
+    pub fn download(self, file_path: &str, filename: Option<&str>) -> AxumResponse {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "File not found",
+            )
+                .into_response();
+        }
+
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "Unable to read file",
+                )
+                    .into_response();
+            }
+        };
+
+        let resolved_name = filename
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("download")
+                    .to_string()
+            });
+
+        // Sanitize filename against header injection
+        let safe_filename = resolved_name.replace(['\r', '\n', '"'], "");
+        let disposition = format!("attachment; filename=\"{}\"", safe_filename);
+
+        let mut res = (StatusCode::OK, Body::from(bytes)).into_response();
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        if let Ok(disp_val) = HeaderValue::try_from(disposition) {
+            res.headers_mut().insert(header::CONTENT_DISPOSITION, disp_val);
+        }
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, must-revalidate"),
+        );
+
+        self.apply_headers(&mut res);
+        res
+    }
+
+    /// Redirect to URL (PHP `$response->redirect($url, $code)`).
+    pub fn redirect(self, url: &str, code: Option<u16>) -> AxumResponse {
+        let status = match code.unwrap_or(302) {
+            301 => StatusCode::MOVED_PERMANENTLY,
+            307 => StatusCode::TEMPORARY_REDIRECT,
+            308 => StatusCode::PERMANENT_REDIRECT,
+            _ => StatusCode::FOUND,
+        };
+
+        let mut res = match HeaderValue::try_from(url) {
+            Ok(loc) => {
+                let mut r = status.into_response();
+                r.headers_mut().insert(header::LOCATION, loc);
+                r
+            }
+            Err(_) => (StatusCode::BAD_REQUEST, "Invalid redirect URL").into_response(),
+        };
+
+        self.apply_headers(&mut res);
+        res
+    }
+
+    /// Helper to copy custom headers onto the final Axum response.
+    fn apply_headers(&self, res: &mut AxumResponse) {
+        for (k, v) in &self.headers {
+            if let (Ok(hname), Ok(hval)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
+                res.headers_mut().insert(hname, hval);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_text() {
+        assert_eq!(status_text(200), "OK");
+        assert_eq!(status_text(201), "Created");
+        assert_eq!(status_text(204), "No Content");
+        assert_eq!(status_text(404), "Not Found");
+        assert_eq!(status_text(422), "Unprocessable Entity");
+        assert_eq!(status_text(500), "Internal Server Error");
+    }
+
+    #[test]
+    fn test_api_response_format() {
+        let resp = ok(json!({"id": 1})).unwrap();
+        assert_eq!(resp.status, 200);
+        let val = format_body(&resp);
+        assert_eq!(val["success"], true);
+        assert_eq!(val["item"]["id"], 1);
+    }
+
+    #[test]
+    fn test_response_builder_text() {
+        let res = Response::new()
+            .header("X-Custom", "test")
+            .text("Hello Padi", Some(200));
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(res.headers().get("x-custom").unwrap(), "test");
+    }
+
+    #[test]
+    fn test_response_redirect() {
+        let res = Response::new().redirect("/login", Some(302));
+        assert_eq!(res.status(), StatusCode::FOUND);
+        assert_eq!(res.headers().get("location").unwrap(), "/login");
     }
 }

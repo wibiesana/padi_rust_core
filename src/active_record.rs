@@ -513,7 +513,7 @@ impl Model {
         // If introspection failed (empty), still stamp timestamps so NOT NULL columns work.
         let has_ts = |c: &str| cols.is_empty() || cols.iter().any(|x| x == c);
         let has = |c: &str| cols.iter().any(|x| x == c);
-        let unset = |d: &Map<String, Value>, c: &str| d.get(c).map_or(true, Value::is_null);
+        let unset = |d: &Map<String, Value>, c: &str| d.get(c).is_none_or(Value::is_null);
         let now = self.now_value();
         let user = current_user_id();
 
@@ -639,7 +639,7 @@ impl Model {
         let offset = (page - 1) * per_page;
         let q = apply_conditions(self.query(), conditions)?;
 
-        let has_cond = conditions.as_object().map_or(false, |o| !o.is_empty());
+        let has_cond = conditions.as_object().is_some_and(|o| !o.is_empty());
         let key = if has_cond { format!("table_count:{}:{}", self.table, conditions) } else { format!("table_count:{}", self.table) };
         let total = match Cache::get(&key).and_then(|v| v.as_i64()) {
             Some(t) => t,
@@ -713,7 +713,7 @@ impl Model {
     /// `loadRelations()`: supports `rel`, `rel:col1,col2`, `rel.nested`, comma separated.
     pub fn load_relations<'a>(
         &'a self,
-        rows: &'a mut Vec<Value>,
+        rows: &'a mut [Value],
         with: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
         Box::pin(async move {
@@ -1012,9 +1012,21 @@ impl ModelQuery {
     pub fn select(mut self, cols: &[&str]) -> Self { self.inner = self.inner.select(cols); self }
     pub fn select_raw(mut self, raw: &str) -> Self { self.inner = self.inner.select_raw(raw); self }
 
-    pub fn with(mut self, relation: &str) -> Self { self.with_relations.push(relation.to_string()); self }
+    /// Return results as plain objects/values (PHP ORM compatibility).
+    pub fn as_array(self) -> Self { self }
+
+    pub fn with(mut self, relation: &str) -> Self {
+        if !relation.contains(':') && relation.contains(',') {
+            self.with_relations.extend(relation.split(',').map(|s| s.trim().to_string()));
+        } else {
+            self.with_relations.push(relation.trim().to_string());
+        }
+        self
+    }
     pub fn with_many(mut self, relations: &[&str]) -> Self {
-        self.with_relations.extend(relations.iter().map(|r| r.to_string()));
+        for r in relations {
+            self = self.with(r);
+        }
         self
     }
     /// `clearWith()`
@@ -1044,23 +1056,62 @@ impl ModelQuery {
     pub fn join(mut self, table: &str, a: &str, op: &str, b: &str) -> Self { self.inner = self.inner.join(table, a, op, b); self }
     pub fn left_join(mut self, table: &str, a: &str, op: &str, b: &str) -> Self { self.inner = self.inner.left_join(table, a, op, b); self }
 
-    /// `joinWith()`: LEFT JOIN the tables of the named relations.
-    pub fn join_with(mut self, relations: &[&str]) -> Result<Self, ApiError> {
+    /// `joinWith()`: LEFT JOIN the tables of the named relations with optional aliases (`"customer c"`).
+    pub fn join_with(self, relations: &[&str]) -> Result<Self, ApiError> {
+        self.join_with_type(relations, "LEFT")
+    }
+
+    /// `innerJoinWith()`: INNER JOIN the tables of the named relations.
+    pub fn inner_join_with(self, relations: &[&str]) -> Result<Self, ApiError> {
+        self.join_with_type(relations, "INNER")
+    }
+
+    /// `joinWith()` with explicit JOIN type ("LEFT" or "INNER").
+    pub fn join_with_type(mut self, relations: &[&str], join_type: &str) -> Result<Self, ApiError> {
         let t = self.model.table;
-        for name in relations {
+        let is_inner = join_type.eq_ignore_ascii_case("inner");
+
+        for rel_str in relations {
+            let mut parts = rel_str.split_whitespace();
+            let name = parts.next().unwrap_or("");
+            let mut alias = parts.next();
+            if alias == Some("AS") || alias == Some("as") {
+                alias = parts.next();
+            }
+
             let rel = self.model.get_relation_config(name)
                 .ok_or_else(|| ApiError::bad_request(format!("Unknown relation: {name}")))?
                 .clone();
             let related = (rel.model)();
+            let join_target = if let Some(a) = alias {
+                format!("{} AS {}", related.table, a)
+            } else {
+                related.table.to_string()
+            };
+            let related_ref = alias.unwrap_or(related.table);
+
             if rel.rel_type == RelationType::BelongsToMany {
                 let pivot = rel.pivot_table.unwrap_or_default();
-                self.inner = self.inner
-                    .left_join(pivot, &format!("{pivot}.{}", rel.foreign_key), "=", &format!("{t}.{}", rel.local_key))
-                    .left_join(related.table, &format!("{}.{}", related.table, related.pk), "=", &format!("{pivot}.{}", rel.related_key.unwrap_or_default()));
+                if is_inner {
+                    self.inner = self.inner
+                        .join(pivot, &format!("{pivot}.{}", rel.foreign_key), "=", &format!("{t}.{}", rel.local_key))
+                        .join(&join_target, &format!("{related_ref}.{}", related.pk), "=", &format!("{pivot}.{}", rel.related_key.unwrap_or_default()));
+                } else {
+                    self.inner = self.inner
+                        .left_join(pivot, &format!("{pivot}.{}", rel.foreign_key), "=", &format!("{t}.{}", rel.local_key))
+                        .left_join(&join_target, &format!("{related_ref}.{}", related.pk), "=", &format!("{pivot}.{}", rel.related_key.unwrap_or_default()));
+                }
+            } else if is_inner {
+                self.inner = self.inner.join(
+                    &join_target,
+                    &format!("{related_ref}.{}", rel.foreign_key),
+                    "=",
+                    &format!("{t}.{}", rel.local_key),
+                );
             } else {
                 self.inner = self.inner.left_join(
-                    related.table,
-                    &format!("{}.{}", related.table, rel.foreign_key),
+                    &join_target,
+                    &format!("{related_ref}.{}", rel.foreign_key),
                     "=",
                     &format!("{t}.{}", rel.local_key),
                 );
@@ -1071,6 +1122,7 @@ impl ModelQuery {
 
     pub fn order_by(mut self, col: &str, dir: &str) -> Self { self.inner = self.inner.order_by(col, dir); self }
     pub fn group_by(mut self, col: &str) -> Self { self.inner = self.inner.group_by(col); self }
+    pub fn having(mut self, sql: &str, params: Vec<Val>) -> Self { self.inner = self.inner.having(sql, params); self }
     pub fn limit(mut self, n: u64) -> Self { self.inner = self.inner.limit(n); self }
     pub fn offset(mut self, n: u64) -> Self { self.inner = self.inner.offset(n); self }
 
@@ -1092,6 +1144,23 @@ impl ModelQuery {
         self.one().await?.ok_or_else(|| ApiError::not_found(format!("Record not found in {}", self.model.table)))
     }
 
+    /// Find a single record by primary key (matching PHP `ModelQuery::findByPk($id)`).
+    pub async fn find_by_pk(&self, id: impl Into<Pk>) -> Result<Option<Value>, ApiError> {
+        let pk = id.into();
+        let mut q = self.clone();
+        for (col, val) in self.model.get_pk_conditions(&pk) {
+            q.inner = q.inner.where_eq(&col, Val::from(&val));
+        }
+        q.one().await
+    }
+
+    /// Find a single record by primary key or throw 404 (matching PHP `ModelQuery::findOrFail($id)`).
+    pub async fn find_or_fail(&self, id: impl Into<Pk>) -> Result<Value, ApiError> {
+        self.find_by_pk(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("Record not found in {}", self.model.table)))
+    }
+
     pub async fn paginate(&self, page: u64, per_page: u64) -> Result<Value, ApiError> {
         let mut r = self.inner.paginate(page, per_page).await?;
         if let Some(Value::Array(rows)) = r.get_mut("data") {
@@ -1099,5 +1168,61 @@ impl ModelQuery {
             *rows = self.model.process_rows(taken, &self.with_relations).await?;
         }
         Ok(r)
+    }
+
+    /// Process results in chunks of `size` with low memory usage (matching PHP `batch($size)`).
+    ///
+    /// The callback receives a batch of models and returns `Ok(true)` to continue
+    /// or `Ok(false)` to break early.
+    pub async fn chunk<F, Fut>(&self, size: u64, mut callback: F) -> Result<(), ApiError>
+    where
+        F: FnMut(Vec<Value>) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, ApiError>>,
+    {
+        let size = size.max(1);
+        let mut page = 1;
+        loop {
+            let rows = self.clone().limit(size).offset((page - 1) * size).all().await?;
+            if rows.is_empty() {
+                break;
+            }
+            let count = rows.len() as u64;
+            let should_continue = callback(rows).await?;
+            if !should_continue || count < size {
+                break;
+            }
+            page += 1;
+        }
+        Ok(())
+    }
+
+    /// Iterate over query results one by one in chunks (matching PHP `each($size)`).
+    ///
+    /// The callback receives each row individually. Return `Ok(true)` to continue
+    /// or `Ok(false)` to break early.
+    pub async fn each<F, Fut>(&self, size: u64, mut callback: F) -> Result<(), ApiError>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, ApiError>>,
+    {
+        let size = size.max(1);
+        let mut page = 1;
+        loop {
+            let rows = self.clone().limit(size).offset((page - 1) * size).all().await?;
+            if rows.is_empty() {
+                break;
+            }
+            let count = rows.len() as u64;
+            for row in rows {
+                if !callback(row).await? {
+                    return Ok(());
+                }
+            }
+            if count < size {
+                break;
+            }
+            page += 1;
+        }
+        Ok(())
     }
 }

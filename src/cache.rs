@@ -102,7 +102,7 @@ fn walk_cache_files(d: &Path, visitor: &mut dyn FnMut(&Path)) {
         if path.is_dir() {
             walk_cache_files(&path, visitor);
             let _ = fs::remove_dir(&path); // only succeeds when empty
-        } else if path.extension().map_or(false, |e| e == "cache") {
+        } else if path.extension().is_some_and(|e| e == "cache") {
             visitor(&path);
         }
     }
@@ -340,7 +340,7 @@ impl Cache {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                .map_or(false, |m| t.saturating_sub(m.as_secs()) < ttl);
+                .is_some_and(|m| t.saturating_sub(m.as_secs()) < ttl);
             if fresh {
                 return;
             }

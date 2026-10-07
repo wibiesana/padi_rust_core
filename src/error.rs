@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::{env, response};
 
@@ -52,7 +52,7 @@ impl IntoResponse for ApiError {
             "message_code": response::status_code_name(status),
         });
         if let Self::Validation(errors) = &self {
-            body["errors"] = Value::from(serde_json::to_value(errors).unwrap_or_default());
+            body["errors"] = serde_json::to_value(errors).unwrap_or_default();
         }
         response::json_response(status, &body)
     }

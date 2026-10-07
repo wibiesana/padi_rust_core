@@ -102,7 +102,7 @@ async fn security_headers(development: bool, req: Request, next: Next) -> Respon
         .headers()
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v.eq_ignore_ascii_case("https"));
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     let mut set = |name: &'static str, value: &'static str| {
@@ -150,7 +150,7 @@ impl Application {
             .max_age(Duration::from_secs(86400))
             .allow_origin(AllowOrigin::predicate(move |origin, _| {
                 dev || cfg.allow_all
-                    || origin.to_str().map_or(false, |o| cfg.origins.iter().any(|a| a == o))
+                    || origin.to_str().is_ok_and(|o| cfg.origins.iter().any(|a| a == o))
             }))
     }
 
@@ -174,7 +174,7 @@ impl Application {
 
     /// Load env, init logger, validate JWT config, connect DB and serve.
     pub async fn run(self) -> Result<(), ApiError> {
-        env::load(&format!("{}/.env", self.root));
+        env::load(format!("{}/.env", self.root));
         Logger::init(&self.root);
         if env::get("JWT_SECRET").is_some() {
             Auth::check_config()?;

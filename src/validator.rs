@@ -66,6 +66,16 @@ impl<'a> Validator<'a> {
         self
     }
 
+    /// Static constructor matching PHP Validator::make($data, $rules, $messages)
+    pub fn make(data: &'a Value, rules: &[(&'a str, &'a str)]) -> Self {
+        Self::new(data, rules)
+    }
+
+    /// Return reference to current error map.
+    pub fn errors(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.errors
+    }
+
     /// Validate; returns only the validated fields or `ApiError::Validation` (422).
     pub async fn validate(mut self) -> Result<Value, ApiError> {
         let mut validated = Map::new();
