@@ -2,7 +2,7 @@
 name = "padi_core"
 version = "0.1.0"
 edition = "2021"
-description = "Core engine for Padi REST API Framework (Rust)"
+description = "Core engine for Padi Rust Api Framework"
 license = "MIT"
 authors = ["Wibiesana <wibiesana@yahoo.com>"]
 repository = "https://github.com/wibiesana/padi_rust_core"

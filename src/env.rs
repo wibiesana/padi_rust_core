@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn test_parse_line_basic() {
         assert_eq!(
-            Env::parse_line("APP_NAME=Padi REST API"),
-            Some(("APP_NAME".to_string(), "Padi REST API".to_string()))
+            Env::parse_line("APP_NAME=Padi Rust Api Framework"),
+            Some(("APP_NAME".to_string(), "Padi Rust Api Framework".to_string()))
         );
         assert_eq!(
             Env::parse_line("export APP_PORT=8080"),

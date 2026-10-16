@@ -170,13 +170,13 @@ impl Console {
     }
 
     pub fn show_help(&self) {
-        println!("\x1b[32mPadi REST API Framework (Rust)\x1b[0m version \x1b[33m0.1.0\x1b[0m\n");
+        println!("\x1b[32mPadi Rust Api Framework\x1b[0m version \x1b[33m0.1.0\x1b[0m\n");
         println!("\x1b[33mUsage:\x1b[0m");
         println!("  padi <command> [options] [arguments]");
         println!("  cargo run -- <command> [options] [arguments]\n");
 
         println!("\x1b[33mAvailable commands:\x1b[0m");
-        println!("  \x1b[32mserve\x1b[0m                      Start Padi REST API server (--port, --host)");
+        println!("  \x1b[32mserve\x1b[0m                      Start Padi Rust Api Framework server (--port, --host)");
         println!("  \x1b[32minit\x1b[0m                       Initialize the application (Run Setup Wizard)");
         println!("  \x1b[32msetup\x1b[0m                      Alias for init");
 

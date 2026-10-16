@@ -10,7 +10,7 @@
 
 </div>
 
-`padi_core` is the core engine for the **Padi REST API Framework** in Rust. It provides ActiveRecord ORM, Axum routing, JWT authentication, file uploads, queue workers, real-time SSE broadcasting, migration runner, code generator, and CLI console tools.
+`padi_core` is the core engine for the **Padi Rust Api Framework**. It provides ActiveRecord ORM, Axum routing, JWT authentication, file uploads, queue workers, real-time SSE broadcasting, migration runner, code generator, and CLI console tools.
 
 ---
 

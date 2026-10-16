@@ -1,4 +1,4 @@
-//! Padi Core - Rust port of the Padi REST API Framework.
+//! Padi Core - Core engine for Padi Rust Api Framework.
 pub mod active_record;
 pub mod application;
 pub mod auth;

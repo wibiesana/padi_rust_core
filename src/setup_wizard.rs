@@ -99,7 +99,7 @@ impl SetupWizard {
     fn banner(&self) {
         let banner = r#"
 ╔════════════════════════════════════════════════════════════════╗
-║             Padi REST API Framework - Setup Wizard             ║
+║             Padi Rust Api Framework - Setup Wizard             ║
 ║                     Rust Edition (axum/sqlx)                   ║
 ║                     Powered by Padi Console                    ║
 ╚════════════════════════════════════════════════════════════════╝
@@ -158,7 +158,7 @@ impl SetupWizard {
             let _ = fs::copy(&example_path, &env_path);
             self.success(".env file created from .env.example");
         } else {
-            let _ = fs::write(&env_path, "# Padi Environment\nAPP_NAME=\"Padi REST API (Rust)\"\nAPP_ENV=development\nAPP_PORT=8080\n");
+            let _ = fs::write(&env_path, "# Padi Environment\nAPP_NAME=\"Padi Rust Api Framework\"\nAPP_ENV=development\nAPP_PORT=8080\n");
             self.success(".env file created with defaults");
         }
 
