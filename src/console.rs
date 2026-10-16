@@ -86,6 +86,15 @@ impl Console {
                 generator.generate_crud_all(force).await?;
             }
 
+            "make:postman" | "create:postman" | "postman" => {
+                let table_name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
+                if let Some(table) = table_name {
+                    generator.generate_api_collection(table, force).await?;
+                } else {
+                    generator.generate_api_collection_all(force).await?;
+                }
+            }
+
             "setup" | "init" | "install" => {
                 let wizard = SetupWizard::new(&self.base_dir);
                 wizard.run().await?;
@@ -185,6 +194,7 @@ impl Console {
         println!("  \x1b[32mmake:model\x1b[0m <table_name>   Create a new model from database table");
         println!("  \x1b[32mmake:resource\x1b[0m <name>        Create a new API resource");
         println!("  \x1b[32mmake:migration\x1b[0m <name>       Create a new SQL migration file");
+        println!("  \x1b[32mmake:postman\x1b[0m [table]       Generate or update Postman api_collection.json");
 
         println!("\n \x1b[33mmigrate\x1b[0m");
         println!("  \x1b[32mmigrate\x1b[0m                     Run pending migrations (--tables=users,posts)");

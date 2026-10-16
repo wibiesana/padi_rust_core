@@ -13,6 +13,7 @@ use std::{
 };
 
 use chrono::Local;
+use serde_json::{json, Value};
 
 use crate::{
     database::{Database, Val},
@@ -420,6 +421,9 @@ DROP TABLE IF EXISTS {table};
         println!("\n4. Generating Route...");
         self.generate_route(name, force)?;
 
+        println!("\n5. Updating Postman API Collection...");
+        let _ = self.generate_api_collection(name, force).await;
+
         println!("\n{}", "=".repeat(60));
         println!("\x1b[32m✓ CRUD generated successfully for table: {}\x1b[0m\n", table_name);
 
@@ -452,6 +456,414 @@ DROP TABLE IF EXISTS {table};
             count
         );
         Ok(())
+    }
+
+    /// Generate or update Postman API Collection (api_collection.json) with standard endpoints for this table.
+    pub async fn generate_api_collection(&self, name: &str, force: bool) -> Result<(), ApiError> {
+        let (table_name, singular, struct_name, _const_name, plural) = Self::normalize_names(name);
+        let path = self.base_dir.join("api_collection.json");
+
+        let mut root: Value = if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            serde_json::from_str(&content).unwrap_or_else(|_| Self::default_api_collection_json())
+        } else {
+            Self::default_api_collection_json()
+        };
+
+        // Ensure variable has singular_id (e.g. product_id)
+        let id_var_key = format!("{}_id", singular);
+        if let Some(vars) = root.get_mut("variable").and_then(|v| v.as_array_mut()) {
+            if !vars.iter().any(|v| v.get("key").and_then(|k| k.as_str()) == Some(&id_var_key)) {
+                vars.push(json!({
+                    "key": id_var_key,
+                    "value": "1"
+                }));
+            }
+        }
+
+        // Get table columns to create realistic dummy sample JSON body
+        let cols = self.get_table_columns(&table_name).await;
+        let mut sample_create_obj = serde_json::Map::new();
+        let mut sample_update_obj = serde_json::Map::new();
+
+        for col in &cols {
+            let c_lower = col.to_ascii_lowercase();
+            if matches!(c_lower.as_str(), "id" | "created_at" | "updated_at" | "created_by" | "updated_by") {
+                continue;
+            }
+            let val = if c_lower.contains("email") {
+                json!("sample@example.com")
+            } else if c_lower.contains("password") {
+                json!("Secret123!")
+            } else if c_lower.contains("price") || c_lower.contains("amount") || c_lower.contains("cost") {
+                json!(99.99)
+            } else if c_lower.contains("qty") || c_lower.contains("stock") || c_lower.contains("count") || c_lower.contains("age") {
+                json!(10)
+            } else if c_lower.starts_with("is_") || c_lower.starts_with("has_") {
+                json!(true)
+            } else if c_lower.contains("phone") {
+                json!("08123456789")
+            } else if c_lower.contains("date") {
+                json!("2026-01-01")
+            } else {
+                json!(format!("Sample {}", Self::pascal_case(&col)))
+            };
+
+            sample_create_obj.insert(col.clone(), val.clone());
+            if sample_update_obj.len() < 2 {
+                sample_update_obj.insert(col.clone(), val);
+            }
+        }
+
+        let create_body_raw = if sample_create_obj.is_empty() {
+            format!("{{\n    \"name\": \"Sample {}\"\n}}", struct_name)
+        } else {
+            serde_json::to_string_pretty(&Value::Object(sample_create_obj)).unwrap_or_default()
+        };
+
+        let update_body_raw = if sample_update_obj.is_empty() {
+            format!("{{\n    \"name\": \"Updated {}\"\n}}", struct_name)
+        } else {
+            serde_json::to_string_pretty(&Value::Object(sample_update_obj)).unwrap_or_default()
+        };
+
+        let next_idx = Self::next_item_index(&root);
+        let folder_title = format!("{}. {}", next_idx, Self::pascal_case(&plural));
+        let test_script = format!(
+            "try {{\n    if (pm.response.code === 201 || pm.response.code === 200) {{\n        const res = pm.response.json();\n        const id = res.data?.id || res.data?.{}?.id;\n        if (id) pm.collectionVariables.set('{}_id', id);\n    }}\n}} catch (e) {{ console.warn('Script bypassed'); }}",
+            singular, singular
+        );
+
+        let new_folder = json!({
+            "name": folder_title,
+            "item": [
+                {
+                    "name": format!("List {}", Self::pascal_case(&plural)),
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}", plural)
+                        }
+                    }
+                },
+                {
+                    "name": format!("List All {}", Self::pascal_case(&plural)),
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}/all", plural)
+                        }
+                    }
+                },
+                {
+                    "name": format!("Get {} By ID", struct_name),
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        }
+                    }
+                },
+                {
+                    "name": format!("Create {}", struct_name),
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": test_script.lines().map(String::from).collect::<Vec<_>>(),
+                                "type": "text/javascript"
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": create_body_raw
+                        },
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}", plural)
+                        }
+                    }
+                },
+                {
+                    "name": format!("Update {}", struct_name),
+                    "request": {
+                        "method": "PUT",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": update_body_raw
+                        },
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        }
+                    }
+                },
+                {
+                    "name": format!("Delete {}", struct_name),
+                    "request": {
+                        "method": "DELETE",
+                        "url": {
+                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        }
+                    }
+                }
+            ]
+        });
+
+        let plural_suffix = Self::pascal_case(&plural);
+        let mut replaced = false;
+        if let Some(items) = root.get_mut("item").and_then(|i| i.as_array_mut()) {
+            for (idx, existing) in items.iter_mut().enumerate() {
+                if let Some(name) = existing.get("name").and_then(|n| n.as_str()) {
+                    let name_clean = name.trim();
+                    if name_clean == plural_suffix
+                        || name_clean.ends_with(&format!(". {}", plural_suffix))
+                        || name_clean.ends_with(&plural_suffix)
+                    {
+                        if !force {
+                            println!("\x1b[33mℹ API Collection folder for '{}' already exists. Skipping (use --force to overwrite).\x1b[0m", plural);
+                            return Ok(());
+                        }
+                        let mut folder_clone = new_folder.clone();
+                        folder_clone["name"] = json!(name);
+                        items[idx] = folder_clone;
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if !replaced {
+                items.push(new_folder);
+            }
+        }
+
+        let formatted = serde_json::to_string_pretty(&root).unwrap_or_default();
+        Self::write_file(&path, formatted)?;
+        println!("\x1b[32m✓ API Collection updated:\x1b[0m {:?} (Resource: {})", path, Self::pascal_case(&plural));
+
+        Ok(())
+    }
+
+    /// Generate or update API Collection for ALL tables discovered in the database.
+    pub async fn generate_api_collection_all(&self, force: bool) -> Result<(), ApiError> {
+        let tables = self.get_all_tables().await;
+        if tables.is_empty() {
+            println!("\x1b[33mNo tables found in database.\x1b[0m");
+            return Ok(());
+        }
+
+        for table in &tables {
+            if Self::is_protected_table(table) && !force {
+                continue;
+            }
+            let _ = self.generate_api_collection(table, force).await;
+        }
+        Ok(())
+    }
+
+    pub fn next_item_index(root: &Value) -> usize {
+        root.get("item")
+            .and_then(|i| i.as_array())
+            .map(|arr| arr.len() + 1)
+            .unwrap_or(1)
+    }
+
+    /// Create a standard base Postman Collection JSON structure.
+    pub fn default_api_collection_json() -> Value {
+        json!({
+            "info": {
+                "_postman_id": uuid::Uuid::new_v4().to_string(),
+                "name": "Padi REST API Collection",
+                "description": "Complete collection generated by Padi Rust Api Framework.",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "auth": {
+                "type": "bearer",
+                "bearer": [
+                    {
+                        "key": "token",
+                        "value": "{{auth_token}}",
+                        "type": "string"
+                    }
+                ]
+            },
+            "variable": [
+                { "key": "base_url", "value": "http://localhost:8080" },
+                { "key": "auth_token", "value": "" },
+                { "key": "user_id", "value": "1" }
+            ],
+            "item": [
+                {
+                    "name": "1. Authentication",
+                    "item": [
+                        {
+                            "name": "Register User",
+                            "event": [
+                                {
+                                    "listen": "test",
+                                    "script": {
+                                        "exec": [
+                                            "try {",
+                                            "    if (pm.response.code === 201 || pm.response.code === 200) {",
+                                            "        const res = pm.response.json();",
+                                            "        const data = res.data || {};",
+                                            "        if (data.token) pm.collectionVariables.set('auth_token', data.token);",
+                                            "        const userId = data.user_id || (data.user ? data.user.id : null) || data.id;",
+                                            "        if (userId) pm.collectionVariables.set('user_id', userId);",
+                                            "    }",
+                                            "} catch (e) { console.warn('Script bypassed'); }"
+                                        ],
+                                        "type": "text/javascript"
+                                    }
+                                }
+                            ],
+                            "request": {
+                                "method": "POST",
+                                "header": [
+                                    { "key": "Content-Type", "value": "application/json" }
+                                ],
+                                "body": {
+                                    "mode": "raw",
+                                    "raw": "{\n    \"name\": \"Test User\",\n    \"email\": \"test@example.com\",\n    \"password\": \"Test123!@#\",\n    \"password_confirmation\": \"Test123!@#\"\n}"
+                                },
+                                "url": { "raw": "{{base_url}}/auth/register" }
+                            }
+                        },
+                        {
+                            "name": "Login",
+                            "event": [
+                                {
+                                    "listen": "test",
+                                    "script": {
+                                        "exec": [
+                                            "try {",
+                                            "    if (pm.response.code === 200) {",
+                                            "        const res = pm.response.json();",
+                                            "        const data = res.data || {};",
+                                            "        if (data.token) pm.collectionVariables.set('auth_token', data.token);",
+                                            "        const userId = data.user_id || (data.user ? data.user.id : null) || data.id;",
+                                            "        if (userId) pm.collectionVariables.set('user_id', userId);",
+                                            "    }",
+                                            "} catch (e) { console.warn('Script bypassed'); }"
+                                        ],
+                                        "type": "text/javascript"
+                                    }
+                                }
+                            ],
+                            "request": {
+                                "method": "POST",
+                                "header": [
+                                    { "key": "Content-Type", "value": "application/json" }
+                                ],
+                                "body": {
+                                    "mode": "raw",
+                                    "raw": "{\n    \"email\": \"test@example.com\",\n    \"password\": \"Test123!@#\"\n}"
+                                },
+                                "url": { "raw": "{{base_url}}/auth/login" }
+                            }
+                        },
+                        {
+                            "name": "Get Me (Profile)",
+                            "request": {
+                                "method": "GET",
+                                "url": { "raw": "{{base_url}}/auth/me" }
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "2. Users",
+                    "item": [
+                        {
+                            "name": "List Users",
+                            "request": {
+                                "method": "GET",
+                                "url": { "raw": "{{base_url}}/users" }
+                            }
+                        },
+                        {
+                            "name": "List All Users",
+                            "request": {
+                                "method": "GET",
+                                "url": { "raw": "{{base_url}}/users/all" }
+                            }
+                        },
+                        {
+                            "name": "Get User By ID",
+                            "request": {
+                                "method": "GET",
+                                "url": { "raw": "{{base_url}}/users/{{user_id}}" }
+                            }
+                        },
+                        {
+                            "name": "Create User",
+                            "event": [
+                                {
+                                    "listen": "test",
+                                    "script": {
+                                        "exec": [
+                                            "try {",
+                                            "    if (pm.response.code === 201 || pm.response.code === 200) {",
+                                            "        const res = pm.response.json();",
+                                            "        const id = res.data?.id || res.data?.user?.id;",
+                                            "        if (id) pm.collectionVariables.set('user_id', id);",
+                                            "    }",
+                                            "} catch (e) { console.warn('Script bypassed'); }"
+                                        ],
+                                        "type": "text/javascript"
+                                    }
+                                }
+                            ],
+                            "request": {
+                                "method": "POST",
+                                "header": [
+                                    { "key": "Content-Type", "value": "application/json" }
+                                ],
+                                "body": {
+                                    "mode": "raw",
+                                    "raw": "{\n    \"name\": \"New User\",\n    \"email\": \"newuser@example.com\",\n    \"password\": \"Password123!\",\n    \"role\": \"user\"\n}"
+                                },
+                                "url": { "raw": "{{base_url}}/users" }
+                            }
+                        },
+                        {
+                            "name": "Update User",
+                            "request": {
+                                "method": "PUT",
+                                "header": [
+                                    { "key": "Content-Type", "value": "application/json" }
+                                ],
+                                "body": {
+                                    "mode": "raw",
+                                    "raw": "{\n    \"name\": \"Updated Name\"\n}"
+                                },
+                                "url": { "raw": "{{base_url}}/users/{{user_id}}" }
+                            }
+                        },
+                        {
+                            "name": "Delete User",
+                            "request": {
+                                "method": "DELETE",
+                                "url": { "raw": "{{base_url}}/users/{{user_id}}" }
+                            }
+                        }
+                    ]
+                }
+            ]
+        })
     }
 
     /// Ensure a `mod.rs` file declares `pub mod <module_name>;` and optionally `pub use <module_name>::<item>;`.
