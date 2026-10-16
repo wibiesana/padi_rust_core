@@ -37,6 +37,15 @@ pub use axum;
 pub use serde_json;
 pub use request::Request;
 
+/// Current unix timestamp in seconds.
+#[inline]
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Everything you normally need in a controller.
 pub mod prelude {
     pub use crate::application::Application;

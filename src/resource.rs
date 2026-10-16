@@ -1,20 +1,20 @@
-//! Resource - transforms raw rows into API response shapes (port of Resource.php).
+//! Resource - API presentation layer and data transformers for Padi Rust Api Framework.
 //!
-//! Mirrors PHP's `Resource` class:
+//! Provides:
 //! - `Resource::wrap(&item)` (Singular): transforms one item into API shape. Null becomes `{}`.
 //! - `Resource::wraps(&collection)` (Plural): transforms a flat array or a paginated `{ data: [...], meta: {...} }` envelope.
-//! - `when_loaded(&item, key)` / `when_loaded_map(&item, key, transform)`: conditionally includes relations only if loaded.
-//! - `ItemResource<T>`: optional instance-wrapper supporting `new(item)`, `resolve()`, and `Serialize` / `jsonSerialize` parity.
+//! - `when_loaded(&item, key)` / `when_loaded_then(&item, key, transform)`: conditionally includes relations only if loaded.
+//! - `ItemResource<R>`: wrapper supporting `new(item)`, `resolve()`, and `Serialize`.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Base trait for API resource transformers (matching PHP `Resource`).
+/// Base trait for API resource transformers.
 pub trait Resource {
-    /// Transform one item into target shape (PHP `toArray(mixed $request): array`).
+    /// Transform one item into target JSON shape.
     fn to_array(item: &Value) -> Value;
 
-    /// Wrap a single resource instance (Singular) - PHP `Resource::wrap($resource)`.
+    /// Wrap a single resource instance (Singular).
     /// If item is null, returns an empty JSON object.
     fn wrap(item: &Value) -> Value {
         if item.is_null() {
@@ -23,7 +23,7 @@ pub trait Resource {
         Self::to_array(item)
     }
 
-    /// Wrap a collection of resources (Plural) - PHP `Resource::wraps($resource)`.
+    /// Wrap a collection of resources (Plural).
     /// Handles both paginated results (containing a `"data"` array) and flat arrays of items.
     fn wraps(items: &Value) -> Value {
         match items {
@@ -42,12 +42,12 @@ pub trait Resource {
     }
 }
 
-/// Conditionally include a relation or field if present and not null (PHP `whenLoaded($key)`).
+/// Conditionally include a relation or field if present and not null (`when_loaded(item, key)`).
 pub fn when_loaded(item: &Value, key: &str) -> Option<Value> {
     item.get(key).filter(|v| !v.is_null()).cloned()
 }
 
-/// Conditionally transform a loaded relation/field (PHP `whenLoaded` with callback).
+/// Conditionally transform a loaded relation/field (`when_loaded_then(item, key, callback)`).
 pub fn when_loaded_then<F>(item: &Value, key: &str, f: F) -> Option<Value>
 where
     F: FnOnce(&Value) -> Value,
@@ -55,7 +55,7 @@ where
     item.get(key).filter(|v| !v.is_null()).map(f)
 }
 
-/// Instance wrapper matching PHP `$res = new UserResource($user); $res->resolve()`.
+/// Instance wrapper for a resource.
 /// Implements `Serialize` so it can be passed directly to `ok()` or Axum responses.
 #[derive(Debug, Clone)]
 pub struct ItemResource<R: Resource> {
@@ -71,12 +71,12 @@ impl<R: Resource> ItemResource<R> {
         }
     }
 
-    /// Resolve the resource to a transformed `Value` (PHP `resolve()`).
+    /// Resolve the resource to a transformed `Value`.
     pub fn resolve(&self) -> Value {
         R::wrap(&self.resource)
     }
 
-    /// Access field dynamically from underlying resource (PHP `__get($name)`).
+    /// Access field dynamically from underlying resource.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.resource.get(name)
     }
@@ -91,7 +91,7 @@ impl<R: Resource> Serialize for ItemResource<R> {
     }
 }
 
-/// Collection wrapper matching PHP `wraps` with `Serialize` support.
+/// Collection wrapper with `Serialize` support.
 #[derive(Debug, Clone)]
 pub struct CollectionResource<R: Resource> {
     pub resources: Value,

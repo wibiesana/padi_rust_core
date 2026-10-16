@@ -1,4 +1,4 @@
-//! Migrator - database migration runner (Rust port of Migrator.php).
+//! Migrator - Database migration runner for Padi Rust Api Framework.
 //!
 //! Supports SQLite, MySQL/MariaDB, and PostgreSQL.
 //! Supports plain `.sql` migrations with optional rollback section:
@@ -276,7 +276,7 @@ impl Migrator {
         Ok(result)
     }
 
-    /// Print formatted migration status table to console (matching PHP `Migrator::status()`).
+    /// Print formatted migration status table to console.
     pub async fn print_status(dir: &str) -> Result<(), ApiError> {
         let items = Self::status(dir).await?;
 

@@ -28,11 +28,30 @@ impl From<&str> for Val { fn from(v: &str) -> Self { Val::Str(v.into()) } }
 impl From<String> for Val { fn from(v: String) -> Self { Val::Str(v) } }
 impl From<i64> for Val { fn from(v: i64) -> Self { Val::Int(v) } }
 impl From<i32> for Val { fn from(v: i32) -> Self { Val::Int(v as i64) } }
+impl From<i16> for Val { fn from(v: i16) -> Self { Val::Int(v as i64) } }
+impl From<i8> for Val { fn from(v: i8) -> Self { Val::Int(v as i64) } }
+impl From<u64> for Val { fn from(v: u64) -> Self { Val::Int(v as i64) } }
 impl From<u32> for Val { fn from(v: u32) -> Self { Val::Int(v as i64) } }
+impl From<u16> for Val { fn from(v: u16) -> Self { Val::Int(v as i64) } }
+impl From<u8> for Val { fn from(v: u8) -> Self { Val::Int(v as i64) } }
+impl From<usize> for Val { fn from(v: usize) -> Self { Val::Int(v as i64) } }
 impl From<f64> for Val { fn from(v: f64) -> Self { Val::Float(v) } }
+impl From<f32> for Val { fn from(v: f32) -> Self { Val::Float(v as f64) } }
 impl From<bool> for Val { fn from(v: bool) -> Self { Val::Bool(v) } }
 impl<T: Into<Val>> From<Option<T>> for Val {
     fn from(v: Option<T>) -> Self { v.map(Into::into).unwrap_or(Val::Null) }
+}
+
+impl std::fmt::Display for Val {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Val::Null => write!(f, "NULL"),
+            Val::Bool(b) => write!(f, "{b}"),
+            Val::Int(i) => write!(f, "{i}"),
+            Val::Float(fl) => write!(f, "{fl}"),
+            Val::Str(s) => write!(f, "{s}"),
+        }
+    }
 }
 
 impl From<&Value> for Val {
@@ -47,6 +66,12 @@ impl From<&Value> for Val {
     }
 }
 impl From<Value> for Val { fn from(v: Value) -> Self { (&v).into() } }
+
+/// Validate whether an identifier is safe (alphanumeric, underscores, dots).
+#[inline]
+pub fn is_valid_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
 
 pub struct Database;
 

@@ -1,7 +1,7 @@
-//! Env - Environment Variable Loader (Rust port of Env.php)
+//! Env - Environment Variable Loader for Padi Rust Api Framework
 //!
 //! Loads `.env` files once and caches values in an in-memory cache.
-//! - Worker-mode & multi-thread safe: cached once during bootstrap, reused across requests.
+//! - Multi-thread safe: loaded once during application startup, reused across requests.
 //! - Fast lookups: in-memory cache avoids repeated system calls.
 //! - Pure Rust parser: zero external runtime dependencies required.
 //! - Compatible with both `Env::...` struct calls and `env::...` module calls.
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, RwLock};
 
-/// Global in-memory cache mimicking PHP's `$_ENV`.
+/// Global in-memory environment cache.
 static CACHE: LazyLock<RwLock<HashMap<String, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 

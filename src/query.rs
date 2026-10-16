@@ -1,4 +1,4 @@
-//! Query - fluent, injection-safe SQL query builder (Rust port of Query.php).
+//! Query - Fluent, injection-safe SQL query builder for Padi Rust Api Framework.
 //!
 //! Security:
 //! - All values are bound via parameterized queries (`?`).
@@ -12,8 +12,8 @@ use crate::{
     error::ApiError,
 };
 
-/// Query builder version matching Query.php.
-pub const VERSION: &str = "2.1.12";
+/// Query builder version.
+pub const VERSION: &str = "0.1.0";
 
 /// Identifiers may contain letters, digits, `_`, `.`, `*` and a single ` as ` alias.
 fn safe_ident(s: &str) -> String {

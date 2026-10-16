@@ -1,39 +1,18 @@
-//! ActiveRecord / Model - full port of `ActiveRecord.php`.
+//! ActiveRecord / Model - High-performance ORM and query engine for Padi Rust Api Framework.
 //!
-//! PHP -> Rust mapping (all instance/static methods are covered):
-//!
-//! | PHP                                   | Rust                                           |
-//! |---------------------------------------|------------------------------------------------|
-//! | `$table/$primaryKey/$fillable/...`    | const builder: `Model::new("t").fillable(..)`  |
-//! | `getTable / getPrimaryKeyName`        | `table_name / primary_key_name`                |
-//! | `clearColumnsCache / getTableColumns` | `clear_columns_cache / get_table_columns`      |
-//! | `with / clearWith / getWith`          | `ModelQuery::with` / (immutable) / `get_with`  |
-//! | `search`                              | `search` (async -> `ModelQuery`)               |
-//! | `find / findBuilder / findQuery`      | `find_query`                                   |
-//! | `get / all`                           | `all_with` / `all`                             |
-//! | `loadRelations / getRelationConfig`   | `load_relations` / `get_relation_config`       |
-//! | `hasMany/hasOne/belongsTo/...`        | `Relation::has_many/has_one/belongs_to/...`    |
-//! | `findByPk / findOne / findAll`        | `find_by_pk / find_one / find_all`             |
-//! | `findOrFail / getPkConditions`        | `find_or_fail / get_pk_conditions`             |
-//! | `where / filterWhere`                 | `where_conditions / filter_where`              |
-//! | `create+insertRecord`                 | `create` (row) / `insert_record` (id)          |
-//! | `update+updateRecord`                 | `update` (row) / `update_record` (bool)        |
-//! | `batchInsert / updateAll`             | `batch_insert / update_all`                    |
-//! | `delete+deleteRecord / deleteAll`     | `delete` / `delete_record` / `delete_all`      |
-//! | `paginate`                            | `paginate` / `paginate_where`                  |
-//! | `query` (raw SQL)                     | `raw`                                          |
-//! | `count / upsert`                      | `count / upsert`                               |
-//! | `hideFields / filterFillable`         | `hide_fields` (+`present`) / `filter_fillable` |
-//! | `beforeSave/afterLoad/afterSave/...`  | hook fn pointers (`before_save`, ...)          |
-//! | audit fields (`Auth::userId()`)       | `with_user(id, fut)` task scope                |
-//!
-//! Not ported: `$connection` / `getDb()` (the Rust core uses one shared pool).
+//! Features:
+//! - Model definition via fluid builder: `Model::new("table").fillable(&[...])`
+//! - Complete CRUD operations (`create`, `find_one`, `find_by_pk`, `update`, `delete`, `paginate`)
+//! - Eager loading and relationships (`has_many`, `has_one`, `belongs_to`, `belongs_to_many`)
+//! - Automatic timestamps (`created_at`, `updated_at`) and audit user tracking (`created_by`, `updated_by`)
+//! - Full-text and multi-column search (`search`, `searchable_relations`)
+//! - Lifecycle hooks (`before_save`, `after_load`, `after_save`, `before_delete`)
+//! - In-memory column cache and query building via `Query` builder
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{OnceLock, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Map, Value};
@@ -48,12 +27,8 @@ use crate::{
 
 // ───────────────────────── helpers ─────────────────────────
 
-fn ident_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-}
-
 fn check_ident(s: &str, what: &str) -> Result<(), ApiError> {
-    if ident_ok(s) {
+    if crate::database::is_valid_ident(s) {
         Ok(())
     } else {
         Err(ApiError::bad_request(format!("Invalid {what}: {s}")))
@@ -115,7 +90,7 @@ fn sanitize_order_by(order_by: &str) -> Result<Vec<(String, String)>, ApiError> 
         let col = it.next().ok_or_else(err)?;
         let dir = it.next();
         if it.next().is_some()
-            || !ident_ok(col)
+            || !crate::database::is_valid_ident(col)
             || col.starts_with(|c: char| c.is_ascii_digit() || c == '.')
         {
             return Err(err());
@@ -131,10 +106,6 @@ fn sanitize_order_by(order_by: &str) -> Result<Vec<(String, String)>, ApiError> 
     Ok(out)
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 // ───────────────────────── audit user scope ─────────────────────────
 
 tokio::task_local! {
@@ -142,7 +113,7 @@ tokio::task_local! {
 }
 
 /// Run `fut` with an authenticated user id so `created_by` / `updated_by`
-/// are filled automatically (equivalent of `Auth::userId()` in PHP).
+/// are filled automatically from the authenticated task scope.
 pub async fn with_user<F: Future>(user_id: Option<i64>, fut: F) -> F::Output {
     CURRENT_USER.scope(user_id, fut).await
 }
@@ -297,7 +268,7 @@ pub struct Model {
     pub after_delete: Option<AfterDelete>,
 }
 
-/// 1:1 name with the PHP class.
+/// Alias for `Model`.
 pub type ActiveRecord = Model;
 
 impl Model {
@@ -387,7 +358,7 @@ impl Model {
     /// Table columns, cached with TTL (`COLUMNS_CACHE_TTL`, default 3600s, 0 = forever).
     pub async fn get_table_columns(&self) -> Vec<String> {
         let ttl = env::get_int("COLUMNS_CACHE_TTL", 3600).max(0) as u64;
-        let now = now_secs();
+        let now = crate::now_secs();
         if let Ok(c) = columns_cache().read() {
             if let Some((cols, at)) = c.get(self.table) {
                 if ttl == 0 || now.saturating_sub(*at) < ttl {
@@ -907,7 +878,7 @@ impl Model {
     }
 
     /// `deleteAll()`: list of primary keys (`[1,2,3]`) or hash conditions
-    /// (empty => deletes every row, like PHP).
+    /// (empty => deletes every row).
     pub async fn delete_all(&self, conditions: &Value) -> Result<u64, ApiError> {
         let q = match conditions.as_array() {
             Some(list) if !list.is_empty() => {
@@ -1012,7 +983,7 @@ impl ModelQuery {
     pub fn select(mut self, cols: &[&str]) -> Self { self.inner = self.inner.select(cols); self }
     pub fn select_raw(mut self, raw: &str) -> Self { self.inner = self.inner.select_raw(raw); self }
 
-    /// Return results as plain objects/values (PHP ORM compatibility).
+    /// Return results as plain objects/values.
     pub fn as_array(self) -> Self { self }
 
     pub fn with(mut self, relation: &str) -> Self {
@@ -1144,7 +1115,7 @@ impl ModelQuery {
         self.one().await?.ok_or_else(|| ApiError::not_found(format!("Record not found in {}", self.model.table)))
     }
 
-    /// Find a single record by primary key (matching PHP `ModelQuery::findByPk($id)`).
+    /// Find a single record by primary key (`find_by_pk(id)`).
     pub async fn find_by_pk(&self, id: impl Into<Pk>) -> Result<Option<Value>, ApiError> {
         let pk = id.into();
         let mut q = self.clone();
@@ -1154,7 +1125,7 @@ impl ModelQuery {
         q.one().await
     }
 
-    /// Find a single record by primary key or throw 404 (matching PHP `ModelQuery::findOrFail($id)`).
+    /// Find a single record by primary key or return 404 (`find_or_fail(id)`).
     pub async fn find_or_fail(&self, id: impl Into<Pk>) -> Result<Value, ApiError> {
         self.find_by_pk(id)
             .await?
@@ -1170,7 +1141,7 @@ impl ModelQuery {
         Ok(r)
     }
 
-    /// Process results in chunks of `size` with low memory usage (matching PHP `batch($size)`).
+    /// Process results in chunks of `size` with low memory usage.
     ///
     /// The callback receives a batch of models and returns `Ok(true)` to continue
     /// or `Ok(false)` to break early.
@@ -1196,7 +1167,7 @@ impl ModelQuery {
         Ok(())
     }
 
-    /// Iterate over query results one by one in chunks (matching PHP `each($size)`).
+    /// Iterate over query results one by one in chunks.
     ///
     /// The callback receives each row individually. Return `Ok(true)` to continue
     /// or `Ok(false)` to break early.

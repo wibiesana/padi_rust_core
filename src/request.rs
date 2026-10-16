@@ -1,14 +1,14 @@
-//! Request handler and extractors (Rust port of Request.php).
+//! Request handler and extractors for Padi Rust Api Framework.
 //!
 //! Provides both lightweight extractors (`Body`, `Params`) and a full-featured
-//! `Request` struct that mirrors PHP's `Request.php` API:
+//! `Request` struct:
 //! - Method, URI, Path
 //! - Query parameters (`query`, `has`)
 //! - Merged inputs (`all`, `input`, `has`, `only`, `except`)
 //! - Headers inspection (`header`, `headers`, `bearer_token`, `is_json`)
 //! - Client IP resolution with trusted proxy / CIDR validation (`ip`)
 //! - Response status code override hook (`set_response_status_code`, `response_status_code`)
-//! - Optional multipart / file support representation
+//! - Multipart and file upload support representation
 
 use std::{
     collections::HashMap,
@@ -34,8 +34,16 @@ pub struct UploadedFile {
 }
 
 /// Dynamic JSON body extractor (empty object when no body). Invalid JSON => 400.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Body(pub Value);
+
+impl std::ops::Deref for Body {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<S: Send + Sync> FromRequest<S> for Body {
     type Rejection = ApiError;
@@ -56,6 +64,14 @@ impl<S: Send + Sync> FromRequest<S> for Body {
 /// Query-string parameters extractor.
 #[derive(Debug, Clone, Default)]
 pub struct Params(pub HashMap<String, String>);
+
+impl std::ops::Deref for Params {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl Params {
     pub fn get(&self, k: &str) -> Option<&str> {
@@ -80,7 +96,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Params {
     }
 }
 
-/// Request encapsulates incoming HTTP request data matching PHP `Request.php`.
+/// Request encapsulates incoming HTTP request data.
 #[derive(Debug, Clone)]
 pub struct Request {
     method: String,

@@ -1,4 +1,4 @@
-//! Code Generator (port of Generator.php)
+//! Code Generator for Padi Rust Api Framework.
 //!
 //! Generates Model, Controller, Resource, Routes, and SQL Migrations.
 //! Supports:
@@ -6,6 +6,7 @@
 //! - Database table column introspection (SQLite PRAGMA, MySQL INFORMATION_SCHEMA, PostgreSQL columns)
 //! - Bulk generation (`generate_crud_all`) for all tables in the database
 //! - Automatic registration into `mod.rs` files (models, resources, controllers, routes with route prefix nesting)
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -18,6 +19,15 @@ use crate::{
     error::ApiError,
 };
 
+/// Internal tables protected from accidental generator overwrites.
+pub const PROTECTED_TABLES: &[&str] = &[
+    "users",
+    "password_resets",
+    "migrations",
+    "_sqlx_migrations",
+    "jobs",
+];
+
 pub struct Generator {
     pub base_dir: PathBuf,
 }
@@ -29,91 +39,74 @@ impl Generator {
         }
     }
 
+    /// Check if a table name is in the protected core tables list.
     pub fn is_protected_table(table_name: &str) -> bool {
-        let protected = [
-            "users",
-            "password_resets",
-            "migrations",
-            "_sqlx_migrations",
-            "jobs",
-        ];
-        protected.contains(&table_name.to_lowercase().as_str())
+        let lower = table_name.to_ascii_lowercase();
+        PROTECTED_TABLES.contains(&lower.as_str())
+    }
+
+    /// Helper to ensure parent directory exists and write file content.
+    fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), ApiError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, content)?;
+        Ok(())
     }
 
     /// Introspect table columns from database (SQLite / MySQL / Postgres).
     pub async fn get_table_columns(&self, table_name: &str) -> Vec<String> {
-        let mut columns = Vec::new();
-
-        if Database::is_sqlite() {
-            let sql = format!("PRAGMA table_info({})", table_name);
-            if let Ok(rows) = Database::fetch_all(&sql, &[]).await {
-                for r in rows {
-                    if let Some(col) = r["name"].as_str() {
-                        columns.push(col.to_string());
-                    }
-                }
-            }
+        let (sql, key, params) = if Database::is_sqlite() {
+            (format!("PRAGMA table_info({})", table_name), "name", vec![])
         } else if Database::is_postgres() {
-            let sql = "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position";
-            if let Ok(rows) = Database::fetch_all(sql, &[Val::from(table_name)]).await {
-                for r in rows {
-                    if let Some(col) = r["column_name"].as_str() {
-                        columns.push(col.to_string());
-                    }
-                }
-            }
+            (
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position".to_string(),
+                "column_name",
+                vec![Val::from(table_name)],
+            )
         } else {
             // MySQL / MariaDB
-            let sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position";
-            if let Ok(rows) = Database::fetch_all(sql, &[Val::from(table_name)]).await {
-                for r in rows {
-                    if let Some(col) = r["column_name"].as_str() {
-                        columns.push(col.to_string());
-                    }
-                }
-            }
-        }
+            (
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position".to_string(),
+                "column_name",
+                vec![Val::from(table_name)],
+            )
+        };
 
-        columns
+        Database::fetch_all(&sql, &params)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| r[key].as_str().map(String::from))
+            .collect()
     }
 
     /// Get all user tables in the database (SQLite / MySQL / Postgres).
     pub async fn get_all_tables(&self) -> Vec<String> {
-        let mut tables = Vec::new();
-
-        if Database::is_sqlite() {
-            let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'";
-            if let Ok(rows) = Database::fetch_all(sql, &[]).await {
-                for r in rows {
-                    if let Some(tbl) = r["name"].as_str() {
-                        tables.push(tbl.to_string());
-                    }
-                }
-            }
+        let (sql, key): (&str, Option<&str>) = if Database::is_sqlite() {
+            (
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                Some("name"),
+            )
         } else if Database::is_postgres() {
-            let sql = "SELECT tablename FROM pg_tables WHERE schemaname = 'public'";
-            if let Ok(rows) = Database::fetch_all(sql, &[]).await {
-                for r in rows {
-                    if let Some(tbl) = r["tablename"].as_str() {
-                        tables.push(tbl.to_string());
-                    }
-                }
-            }
+            (
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+                Some("tablename"),
+            )
         } else {
             // MySQL
-            let sql = "SHOW TABLES";
-            if let Ok(rows) = Database::fetch_all(sql, &[]).await {
-                for r in rows {
-                    if let Some(obj) = r.as_object() {
-                        if let Some(val) = obj.values().next().and_then(|v| v.as_str()) {
-                            tables.push(val.to_string());
-                        }
-                    }
-                }
-            }
-        }
+            ("SHOW TABLES", None)
+        };
 
-        tables
+        let rows = Database::fetch_all(sql, &[]).await.unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|r| match key {
+                Some(k) => r[k].as_str().map(String::from),
+                None => r.as_object().and_then(|obj| {
+                    obj.values().next().and_then(|v| v.as_str()).map(String::from)
+                }),
+            })
+            .collect()
     }
 
     /// Normalize an input name (e.g. `Product`, `products`, `OrderItem`, `order_items`)
@@ -166,11 +159,10 @@ impl Generator {
         let fillable: Vec<String> = cols
             .into_iter()
             .filter(|c| {
-                c != "id"
-                    && c != "created_at"
-                    && c != "updated_at"
-                    && c != "created_by"
-                    && c != "updated_by"
+                !matches!(
+                    c.as_str(),
+                    "id" | "created_at" | "updated_at" | "created_by" | "updated_by"
+                )
             })
             .collect();
 
@@ -196,11 +188,7 @@ pub const {const_name}: Model = Model::new("{table_name}")
             )
         };
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-
-        fs::write(&path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&path, content)?;
         Self::update_models_mod_rs(&self.base_dir, file_stem, &const_name)?;
         println!("\x1b[32m✓ Model created:\x1b[0m {:?}", path);
 
@@ -268,11 +256,7 @@ impl Resource for {resource_struct} {{
             )
         };
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-
-        fs::write(&path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&path, content)?;
         Self::update_resources_mod_rs(&self.base_dir, file_stem, &resource_struct)?;
         println!("\x1b[32m✓ Resource created:\x1b[0m {:?}", path);
 
@@ -337,11 +321,7 @@ pub async fn destroy(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
 "#
         );
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-
-        fs::write(&path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&path, content)?;
         Self::update_controllers_mod_rs(&self.base_dir, file_stem)?;
         println!("\x1b[32m✓ Controller created:\x1b[0m {:?}", path);
 
@@ -377,11 +357,7 @@ pub fn routes() -> Router {{
 "#
         );
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-
-        fs::write(&path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&path, content)?;
         Self::update_routes_mod_rs(&self.base_dir, &plural, &route_prefix)?;
         println!("\x1b[32m✓ Route created:\x1b[0m {:?}", path);
 
@@ -394,8 +370,6 @@ pub fn routes() -> Router {{
         let file_name = format!("{}_{}.sql", timestamp, Self::snake_case(name));
         let dir = self.base_dir.join("database/migrations");
         let path = dir.join(file_name);
-
-        fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
 
         let table_name = Self::infer_table_name_from_migration(name);
         let template = format!(
@@ -413,7 +387,7 @@ DROP TABLE IF EXISTS {table};
             table = table_name
         );
 
-        fs::write(&path, template).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&path, template)?;
         println!("\x1b[32m✓ Migration created:\x1b[0m {:?}", path);
 
         Ok(())
@@ -480,35 +454,49 @@ DROP TABLE IF EXISTS {table};
         Ok(())
     }
 
-    fn update_models_mod_rs(
-        base_dir: &Path,
+    /// Ensure a `mod.rs` file declares `pub mod <module_name>;` and optionally `pub use <module_name>::<item>;`.
+    fn ensure_mod_rs(
+        mod_path: &Path,
         module_name: &str,
-        const_name: &str,
+        reexport_item: Option<&str>,
     ) -> Result<(), ApiError> {
-        let mod_path = base_dir.join("src/models/mod.rs");
         let mut content = if mod_path.exists() {
-            fs::read_to_string(&mod_path).unwrap_or_default()
+            fs::read_to_string(mod_path).unwrap_or_default()
         } else {
             String::new()
         };
 
         let pub_mod = format!("pub mod {};", module_name);
-        let pub_use = format!("pub use {}::{};", module_name, const_name);
-
         let mut modified = false;
+
         if !content.contains(&pub_mod) {
-            content.push_str(&format!("{}\n", pub_mod));
+            content.push_str(&pub_mod);
+            content.push('\n');
             modified = true;
         }
-        if !content.contains(&pub_use) {
-            content.push_str(&format!("{}\n", pub_use));
-            modified = true;
+
+        if let Some(item) = reexport_item {
+            let pub_use = format!("pub use {}::{};", module_name, item);
+            if !content.contains(&pub_use) {
+                content.push_str(&pub_use);
+                content.push('\n');
+                modified = true;
+            }
         }
 
         if modified {
-            fs::write(&mod_path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+            Self::write_file(mod_path, content)?;
         }
+
         Ok(())
+    }
+
+    fn update_models_mod_rs(
+        base_dir: &Path,
+        module_name: &str,
+        const_name: &str,
+    ) -> Result<(), ApiError> {
+        Self::ensure_mod_rs(&base_dir.join("src/models/mod.rs"), module_name, Some(const_name))
     }
 
     fn update_resources_mod_rs(
@@ -516,46 +504,11 @@ DROP TABLE IF EXISTS {table};
         module_name: &str,
         struct_name: &str,
     ) -> Result<(), ApiError> {
-        let mod_path = base_dir.join("src/resources/mod.rs");
-        let mut content = if mod_path.exists() {
-            fs::read_to_string(&mod_path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let pub_mod = format!("pub mod {};", module_name);
-        let pub_use = format!("pub use {}::{};", module_name, struct_name);
-
-        let mut modified = false;
-        if !content.contains(&pub_mod) {
-            content.push_str(&format!("{}\n", pub_mod));
-            modified = true;
-        }
-        if !content.contains(&pub_use) {
-            content.push_str(&format!("{}\n", pub_use));
-            modified = true;
-        }
-
-        if modified {
-            fs::write(&mod_path, content).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-        Ok(())
+        Self::ensure_mod_rs(&base_dir.join("src/resources/mod.rs"), module_name, Some(struct_name))
     }
 
     fn update_controllers_mod_rs(base_dir: &Path, module_name: &str) -> Result<(), ApiError> {
-        let mod_path = base_dir.join("src/controllers/mod.rs");
-        let mut content = if mod_path.exists() {
-            fs::read_to_string(&mod_path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let pub_mod = format!("pub mod {};", module_name);
-        if !content.contains(&pub_mod) {
-            content.push_str(&format!("{}\n", pub_mod));
-            fs::write(&mod_path, content).map_err(|e| ApiError::internal(e.to_string()))?;
-        }
-        Ok(())
+        Self::ensure_mod_rs(&base_dir.join("src/controllers/mod.rs"), module_name, None)
     }
 
     fn update_routes_mod_rs(
@@ -598,7 +551,7 @@ DROP TABLE IF EXISTS {table};
             }
         }
 
-        fs::write(&mod_path, content).map_err(|e| ApiError::internal(e.to_string()))?;
+        Self::write_file(&mod_path, content)?;
         Ok(())
     }
 
@@ -644,31 +597,23 @@ DROP TABLE IF EXISTS {table};
     }
 
     pub fn pluralize(s: &str) -> String {
-        if s.ends_with('y')
-            && !s.ends_with("ay")
-            && !s.ends_with("ey")
-            && !s.ends_with("oy")
-            && !s.ends_with("uy")
-        {
-            format!("{}ies", &s[..s.len() - 1])
-        } else if s.ends_with('s')
-            || s.ends_with('x')
-            || s.ends_with('z')
-            || s.ends_with("ch")
-            || s.ends_with("sh")
-        {
-            format!("{}es", s)
+        if let Some(stem) = s.strip_suffix('y') {
+            if !stem.ends_with(['a', 'e', 'o', 'u']) {
+                return format!("{stem}ies");
+            }
+        }
+
+        if s.ends_with(['s', 'x', 'z']) || s.ends_with("ch") || s.ends_with("sh") {
+            format!("{s}es")
         } else {
-            format!("{}s", s)
+            format!("{s}s")
         }
     }
 
     pub fn singularize(s: &str) -> String {
         if let Some(prefix) = s.strip_suffix("ies") {
-            format!("{}y", prefix)
-        } else if s.ends_with("es")
-            && (s.ends_with("shes") || s.ends_with("ches") || s.ends_with("sses"))
-        {
+            format!("{prefix}y")
+        } else if s.ends_with("shes") || s.ends_with("ches") || s.ends_with("sses") {
             s.strip_suffix("es").unwrap_or(s).to_string()
         } else if s.ends_with('s') && !s.ends_with("ss") {
             s.strip_suffix('s').unwrap_or(s).to_string()
@@ -685,5 +630,87 @@ DROP TABLE IF EXISTS {table};
             }
         }
         snake
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_protected_table() {
+        assert!(Generator::is_protected_table("users"));
+        assert!(Generator::is_protected_table("Users"));
+        assert!(Generator::is_protected_table("MIGRATIONS"));
+        assert!(Generator::is_protected_table("jobs"));
+        assert!(!Generator::is_protected_table("products"));
+        assert!(!Generator::is_protected_table("order_items"));
+    }
+
+    #[test]
+    fn test_snake_case() {
+        assert_eq!(Generator::snake_case("Product"), "product");
+        assert_eq!(Generator::snake_case("OrderItem"), "order_item");
+        assert_eq!(Generator::snake_case("order-item"), "order_item");
+        assert_eq!(Generator::snake_case("order item"), "order_item");
+    }
+
+    #[test]
+    fn test_screaming_snake_case() {
+        assert_eq!(Generator::screaming_snake_case("Product"), "PRODUCT");
+        assert_eq!(Generator::screaming_snake_case("order_items"), "ORDER_ITEMS");
+    }
+
+    #[test]
+    fn test_pascal_case() {
+        assert_eq!(Generator::pascal_case("product"), "Product");
+        assert_eq!(Generator::pascal_case("order_item"), "OrderItem");
+        assert_eq!(Generator::pascal_case("order-item"), "OrderItem");
+    }
+
+    #[test]
+    fn test_kebab_case() {
+        assert_eq!(Generator::kebab_case("OrderItem"), "order-item");
+        assert_eq!(Generator::kebab_case("order_items"), "order-items");
+    }
+
+    #[test]
+    fn test_pluralize() {
+        assert_eq!(Generator::pluralize("product"), "products");
+        assert_eq!(Generator::pluralize("category"), "categories");
+        assert_eq!(Generator::pluralize("day"), "days");
+        assert_eq!(Generator::pluralize("box"), "boxes");
+        assert_eq!(Generator::pluralize("watch"), "watches");
+    }
+
+    #[test]
+    fn test_singularize() {
+        assert_eq!(Generator::singularize("products"), "product");
+        assert_eq!(Generator::singularize("categories"), "category");
+        assert_eq!(Generator::singularize("wishes"), "wish");
+        assert_eq!(Generator::singularize("watches"), "watch");
+        assert_eq!(Generator::singularize("bosses"), "boss");
+    }
+
+    #[test]
+    fn test_infer_table_name_from_migration() {
+        assert_eq!(
+            Generator::infer_table_name_from_migration("create_products_table"),
+            "products"
+        );
+        assert_eq!(
+            Generator::infer_table_name_from_migration("add_index_to_users"),
+            "add_index_to_users"
+        );
+    }
+
+    #[test]
+    fn test_normalize_names() {
+        let (tbl, sing, struc, cnst, plur) = Generator::normalize_names("OrderItem");
+        assert_eq!(tbl, "order_items");
+        assert_eq!(sing, "order_item");
+        assert_eq!(struc, "OrderItem");
+        assert_eq!(cnst, "ORDER_ITEMS");
+        assert_eq!(plur, "order_items");
     }
 }

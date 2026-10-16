@@ -165,7 +165,7 @@ impl Realtime {
     /// Reads query params:
     /// - `?topic=my-channel`
     /// - `?topics=channel1,channel2`
-    pub async fn sse_handler(
+    pub fn sse_handler(
         Query(params): Query<SseParams>,
     ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
         let mut topic_list = Vec::new();

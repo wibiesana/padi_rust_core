@@ -1,15 +1,14 @@
-//! Response handling and formatting (port of Response.php & Router::formatResponse).
+//! Response handling and formatting for Padi Rust Api Framework.
 //!
 //! Provides both idiomatic Axum response constructors (`ok`, `created`, `no_content`,
-//! `ApiResponse`, `ApiResult`) and the full-featured builder `Response` / `ResponseBuilder`
-//! matching PHP `Response.php`:
+//! `ApiResponse`, `ApiResult`) and the full-featured builder `Response` / `ResponseBuilder`:
 //! - `json(data, status)`
 //! - `text(data, status)`
 //! - `html(data, status)`
 //! - `download(file_path, filename)`
 //! - `redirect(url, status)`
 //! - `header(key, value)` & `status(code)`
-//! - `status_text(code)` (matching PHP `getStatusText`)
+//! - `status_text(code)`
 
 use std::collections::HashMap;
 
@@ -25,28 +24,12 @@ use crate::{env, error::ApiError};
 
 pub type ApiResult = Result<ApiResponse, ApiError>;
 
-/// Get HTTP status text matching PHP Response::getStatusText($code).
+/// Get standard HTTP status canonical reason text.
 pub fn status_text(code: u16) -> &'static str {
-    match code {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        422 => "Unprocessable Entity",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Unknown Status",
-    }
+    StatusCode::from_u16(code)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("Unknown Status")
 }
 
 /// Get standardized UPPERCASE error/status code name (e.g. "VALIDATION_FAILED").
@@ -184,17 +167,17 @@ impl IntoResponse for ApiResponse {
 }
 
 // -----------------------------------------------------------------------------
-// Response Builder matching PHP Response.php API
+// Fluent Response Builder
 // -----------------------------------------------------------------------------
 
-/// Response builder mimicking PHP's `Response` instance methods.
+/// Response builder for constructing custom HTTP responses.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseBuilder {
     status_code: u16,
     headers: HashMap<String, String>,
 }
 
-/// Type alias for PHP parity (`Response::json(...)`, `Response::text(...)`, etc.).
+/// Type alias for ergonomic access (`Response::json(...)`, `Response::text(...)`, etc.).
 pub type Response = ResponseBuilder;
 
 impl ResponseBuilder {
@@ -205,19 +188,19 @@ impl ResponseBuilder {
         }
     }
 
-    /// Set response header (PHP `$response->header($key, $value)`).
+    /// Set response header (`response.header(key, value)`).
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
 
-    /// Set HTTP status code (PHP `$response->status($code)`).
+    /// Set HTTP status code (`response.status(code)`).
     pub fn status(mut self, code: u16) -> Self {
         self.status_code = code;
         self
     }
 
-    /// Build JSON response (PHP `$response->json($data, $statusCode)`).
+    /// Build JSON response (`response.json(data, statusCode)`).
     pub fn json(self, data: impl Serialize, status_code: Option<u16>) -> AxumResponse {
         let code = status_code.unwrap_or(self.status_code);
         let val = serde_json::to_value(data).unwrap_or(Value::Null);
@@ -231,7 +214,7 @@ impl ResponseBuilder {
         Self::new().status(code).json(data, Some(code))
     }
 
-    /// Build plain text response (PHP `$response->text($data, $code)`).
+    /// Build plain text response (`response.text(data, code)`).
     pub fn text(self, data: impl Into<String>, code: Option<u16>) -> AxumResponse {
         let status = StatusCode::from_u16(code.unwrap_or(self.status_code))
             .unwrap_or(StatusCode::OK);
@@ -250,7 +233,7 @@ impl ResponseBuilder {
         Self::new().text(data, Some(code))
     }
 
-    /// Build HTML response (PHP `$response->html($data, $code)`).
+    /// Build HTML response (`response.html(data, code)`).
     pub fn html(self, data: impl Into<String>, code: Option<u16>) -> AxumResponse {
         let status = StatusCode::from_u16(code.unwrap_or(self.status_code))
             .unwrap_or(StatusCode::OK);
@@ -260,7 +243,7 @@ impl ResponseBuilder {
         res
     }
 
-    /// Send file download (PHP `$response->download($filePath, $filename)`).
+    /// Send file download (`response.download(file_path, filename)`).
     pub fn download(self, file_path: &str, filename: Option<&str>) -> AxumResponse {
         let path = std::path::Path::new(file_path);
         if !path.exists() {
@@ -314,7 +297,7 @@ impl ResponseBuilder {
         res
     }
 
-    /// Redirect to URL (PHP `$response->redirect($url, $code)`).
+    /// Redirect to URL (`response.redirect(url, code)`).
     pub fn redirect(self, url: &str, code: Option<u16>) -> AxumResponse {
         let status = match code.unwrap_or(302) {
             301 => StatusCode::MOVED_PERMANENTLY,

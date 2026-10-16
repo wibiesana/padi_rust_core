@@ -1,4 +1,4 @@
-//! Logger - daily file logs (app-*.log, error-*.log) + stdout (Rust port of Logger.php).
+//! Logger - Daily rolling file logs (app-*.log, error-*.log) and stdout console logging.
 use std::{fs, sync::OnceLock, time::Duration};
 
 use tracing_appender::non_blocking::WorkerGuard;

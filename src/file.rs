@@ -1,4 +1,4 @@
-//! File Upload/Storage Helper (Rust port of File.php).
+//! File Upload and Storage Helper for Padi Rust Api Framework.
 //!
 //! ## Storage Best Practice — "Relative Path in DB, Full URL in Response"
 //!
@@ -12,8 +12,8 @@
 //! Security features:
 //! - Path traversal prevention (`sanitize_path`)
 //! - Dangerous extension blacklist + optional whitelist
-//! - Content inspection defense-in-depth (PHP tag / script detection)
-//! - Secure randomized filenames (UUID v4 32-hex chars matching PHP `bin2hex(random_bytes(16))`)
+//! - Content inspection defense-in-depth (script tag detection)
+//! - Secure randomized filenames via UUID v4
 //! - Secure directory permissions
 
 use std::{
@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 use crate::{env, error::ApiError};
 
-/// Default maximum file size: 5MB (matching File.php 5242880 bytes).
+/// Default maximum file size: 5MB (5242880 bytes).
 pub const DEFAULT_MAX_SIZE: usize = 5 * 1024 * 1024;
 
-/// Dangerous file extensions blacklist (matching File.php).
+/// Dangerous file extensions blacklist.
 const DANGEROUS_EXTENSIONS: &[&str] = &[
     "php", "phtml", "phar", "php3", "php4", "php5", "php7", "php8", "phps", "cgi", "pl", "asp",
     "aspx", "shtml", "htaccess", "sh", "bat", "cmd", "com", "exe", "dll", "msi", "py", "rb",
@@ -55,7 +55,7 @@ impl<'a> Default for UploadOptions<'a> {
 
 pub struct FileHelper;
 
-/// Type alias for PHP parity (`File::upload(...)`, `File::url(...)`).
+/// Type alias for ergonomic access (`File::upload(...)`, `File::url(...)`).
 pub type File = FileHelper;
 
 impl FileHelper {
@@ -304,12 +304,12 @@ impl FileHelper {
         }
     }
 
-    /// Content inspection defense-in-depth against embedded PHP / script attacks.
+    /// Content inspection defense-in-depth against malicious scripts.
     fn validate_content_safety(bytes: &[u8]) -> Result<(), ApiError> {
         let probe_len = bytes.len().min(4096);
         let probe = &bytes[..probe_len];
 
-        // Block embedded PHP tags and script tags
+        // Block embedded code tags and script tags
         if probe.windows(5).any(|w| w.eq_ignore_ascii_case(b"<?php"))
             || probe.windows(3).any(|w| w == b"<?=")
             || probe.windows(7).any(|w| w.eq_ignore_ascii_case(b"<script"))

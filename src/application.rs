@@ -1,22 +1,12 @@
-//! Application bootstrap (port of Application.php): env, logging, DB, CORS, gzip,
-//! security headers, JSON 404/panic handling and graceful shutdown.
+//! Application bootstrap for Padi Rust Api Framework: env, logging, DB pool, CORS,
+//! compression, security headers, JSON 404/panic handling and graceful shutdown.
 //!
-//! PHP -> Rust mapping:
-//!
-//! | PHP                                  | Rust                                              |
-//! |--------------------------------------|---------------------------------------------------|
-//! | `bootstrap()` (env, config, CORS)    | `Application::run()` + `CorsConfig::from_env()`   |
-//! | `isDevelopment` (`APP_ENV`)          | `Application::is_development()`                   |
-//! | `handleCors()` / preflight           | `Application::cors()` (origin reflect + credentials, max-age 24h) |
-//! | `sendSecurityHeaders()`              | `security_headers` middleware (incl. HSTS on https) |
-//! | `handleException()`                  | `on_panic` (generic 500, details only in debug)   |
-//! | `handleRequest()` 404                | `not_found`                                       |
-//! | `run()`                              | `Application::run()`                              |
-//!
-//! Not applicable in Rust (handled by the runtime): FrankenPHP worker mode
-//! (`healthCheckConnections`, `cleanupRequest`, `MAX_REQUESTS`/`GC_INTERVAL`),
-//! `normalizeUri` (shared-hosting subdirectory fix), `set_error_handler`,
-//! and PDO reconnect (sqlx pool reconnects automatically).
+//! Provides:
+//! - Full server lifecycle management (`Application::run()`)
+//! - Configurable CORS policy (`CorsConfig::from_env()`)
+//! - Strict security headers middleware (HSTS, X-Content-Type-Options, Frame protection)
+//! - JSON error responses on 404 and uncaught panics
+//! - Graceful SIGINT/SIGTERM shutdown signal listeners
 use std::{any::Any, time::Duration};
 
 use axum::{
@@ -126,7 +116,7 @@ impl Application {
         Self { router, root: root.trim_end_matches('/').to_string() }
     }
 
-    /// `APP_ENV=development` (relaxes CORS like the PHP version).
+    /// Check if application is running in development mode (`APP_ENV=development`).
     pub fn is_development() -> bool {
         env::get("APP_ENV").as_deref() == Some("development")
     }

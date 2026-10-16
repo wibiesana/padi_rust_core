@@ -51,10 +51,6 @@ fn parse_date(s: &str) -> Option<chrono::NaiveDateTime> {
         .or_else(|| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().and_then(|d| d.and_hms_opt(0, 0, 0)))
 }
 
-fn ident_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 impl<'a> Validator<'a> {
     pub fn new(data: &'a Value, rules: &[(&'a str, &'a str)]) -> Self {
         Self { data, rules: rules.to_vec(), messages: BTreeMap::new(), errors: BTreeMap::new() }
@@ -66,7 +62,7 @@ impl<'a> Validator<'a> {
         self
     }
 
-    /// Static constructor matching PHP Validator::make($data, $rules, $messages)
+    /// Construct a new validator for the given data and rules.
     pub fn make(data: &'a Value, rules: &[(&'a str, &'a str)]) -> Self {
         Self::new(data, rules)
     }
@@ -190,7 +186,7 @@ impl<'a> Validator<'a> {
             }
             "array" => if !v.is_array() { self.err(f, rule, "The {field} must be an array".into()) },
             "json" => {
-                let ok = v.as_str().map(|s| serde_json::from_str::<Value>(s).is_ok()).unwrap_or(false);
+                let ok = v.as_str().is_some_and(|s| serde_json::from_str::<Value>(s).is_ok());
                 if !ok { self.err(f, rule, "The {field} must be a valid JSON string".into()) }
             }
             "email" => {
@@ -227,7 +223,7 @@ impl<'a> Validator<'a> {
                 self.err(f, rule, "The {field} must only contain letters, numbers, dashes, and underscores".into())
             },
             "regex" => {
-                let ok = Regex::new(arg.unwrap_or("")).map(|r| r.is_match(&as_str(&v))).unwrap_or(false);
+                let ok = Regex::new(arg.unwrap_or("")).is_ok_and(|r| r.is_match(&as_str(&v)));
                 if !ok { self.err(f, rule, "The {field} format is invalid".into()) }
             }
             "min" => {
@@ -288,7 +284,7 @@ impl<'a> Validator<'a> {
     }
 
     async fn count_where(&self, table: &str, col: &str, v: &Value, ignore: Option<&str>, idc: &str) -> Result<bool, ApiError> {
-        if !ident_ok(table) || !ident_ok(col) || !ident_ok(idc) {
+        if !crate::database::is_valid_ident(table) || !crate::database::is_valid_ident(col) || !crate::database::is_valid_ident(idc) {
             return Err(ApiError::internal(format!("Invalid identifier in validation rule: {table}.{col}")));
         }
         let mut sql = format!("SELECT COUNT(*) AS c FROM {table} WHERE {col} = ?");

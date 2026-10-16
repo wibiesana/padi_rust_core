@@ -1,14 +1,14 @@
-//! Router engine and Axum routing helpers (port of Router.php).
+//! Router engine and Axum routing helpers for Padi Rust Api Framework.
 //!
 //! Provides:
-//! - Fluent Axum router extension methods (`get`, `post`, `put`, `patch`, `delete`, `any`, `group`, `version`)
-//! - Dedicated `Router` builder matching PHP's `Router` API:
-//!     - `$router->get('/path', handler)`
-//!     - `$router->post('/path', handler)`
-//!     - `$router->group(['prefix' => '/api'], callback)`
-//!     - `$router->version('v1', callback)`
-//!     - `$router->any('/path', handler)`
-//! - Automatic status code & message names mapping (`status_code_name`)
+//! - Fluent Axum router extension methods (`get_route`, `post_route`, `put_route`, `patch_route`, `delete_route`, `group`, `version`)
+//! - Dedicated `Router` builder:
+//!     - `router.get("/path", handler)`
+//!     - `router.post("/path", handler)`
+//!     - `router.group("/prefix", callback)`
+//!     - `router.version("v1", callback)`
+//!     - `router.any("/path", handler)`
+//! - Direct Axum router conversion (`into_axum()`)
 
 use axum::{
     handler::Handler,
@@ -16,7 +16,7 @@ use axum::{
     Router as AxumRouter,
 };
 
-/// Extension trait for Axum `Router` to support PHP-style fluid definitions.
+/// Extension trait for Axum `Router` to support fluid route definitions.
 pub trait RouterExt: Sized {
     /// Mount route group under a path prefix.
     fn group<F>(self, prefix: &str, configure: F) -> Self
@@ -135,7 +135,7 @@ impl RouterExt for AxumRouter {
     }
 }
 
-/// Router builder mimicking PHP Router instance.
+/// Router builder for fluent route construction.
 #[derive(Debug, Default)]
 pub struct Router {
     inner: AxumRouter,
@@ -205,7 +205,7 @@ impl Router {
         self
     }
 
-    /// Add a route matching all methods (PHP `$router->any(...)`).
+    /// Add a route matching all HTTP methods (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`).
     pub fn any<H, T>(mut self, path: &str, handler: H) -> Self
     where
         H: Handler<T, ()> + Clone + Send + 'static,

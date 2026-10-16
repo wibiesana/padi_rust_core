@@ -1,8 +1,8 @@
-//! Queue - database-backed job queue (Rust port of Queue.php).
+//! Queue - Database-backed job queue for Padi Rust Api Framework.
 //!
 //! Features:
 //! - Multi-database support (`sqlite`, `pgsql`, `mysql`).
-//! - Shared-hosting & zero-infrastructure safe: runs over existing database connection.
+//! - Runs asynchronously over existing database pool without requiring external message brokers.
 //! - Async worker loop with graceful restart (`QUEUE_MAX_JOBS`), retry backoff, and max attempts.
 //! - Registration of async job handlers (`Queue::register`, `Queue::register_sync`).
 
@@ -11,7 +11,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, LazyLock, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use serde_json::{json, Value};
@@ -29,11 +29,9 @@ pub type AsyncJobHandler = Arc<dyn Fn(Value) -> BoxFuture<'static, Result<(), Ap
 static HANDLERS: LazyLock<RwLock<HashMap<String, AsyncJobHandler>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+#[inline]
 fn current_time_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::now_secs() as i64
 }
 
 pub struct Queue;

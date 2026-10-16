@@ -14,6 +14,10 @@ pub enum ApiError {
     Validation(BTreeMap<String, Vec<String>>),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 impl ApiError {
@@ -30,7 +34,8 @@ impl ApiError {
         match self {
             Self::Http { status, .. } => *status,
             Self::Validation(_) => 422,
-            Self::Db(_) => 500,
+            Self::Db(_) | Self::Io(_) => 500,
+            Self::Json(_) => 400,
         }
     }
 }

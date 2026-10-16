@@ -1,11 +1,11 @@
-//! Auth - JWT token management (port of Auth.php) + axum extractors.
+//! Auth - JWT authentication and Axum request extractors for Padi Rust Api Framework.
 //!
-//! PHP -> Rust mapping:
-//! `init` -> `check_config` (keys cached once in a `OnceLock`), `generateToken` -> `generate_token`,
-//! `verifyToken` -> `verify_token`, `user` / `userId` -> `Auth::user(parts)` / `Auth::user_id(parts)`,
-//! `extractToken` -> `Auth::extract_token(parts)`, `reset` -> `Auth::reset` (no-op: Rust keeps no
-//! per-request global state, the decoded user lives in the `AuthUser` extractor).
-//! `Auth::userId()` for audit fields -> `AuthUser::run_as` (see `active_record::with_user`).
+//! Provides:
+//! - Cryptographically secure JWT creation (`Auth::generate_token`)
+//! - Signature verification and payload decoding (`Auth::verify_token`)
+//! - Header Bearer token extraction (`Auth::extract_token`)
+//! - Direct Axum extractors (`AuthUser`) for type-safe route protection
+//! - Task-local user scoping for database audit logs (`with_user`)
 use std::sync::OnceLock;
 
 use axum::{extract::FromRequestParts, http::request::Parts};

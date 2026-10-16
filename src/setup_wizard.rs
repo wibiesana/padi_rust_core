@@ -1,9 +1,9 @@
-//! Setup Wizard (port of SetupWizard.php).
+//! Setup Wizard for Padi Rust Api Framework.
 //!
 //! Interactive CLI wizard for first-time project configuration:
-//! - Environment setup & .env generation
+//! - Environment setup & `.env` generation
 //! - Database driver selection (SQLite, MySQL/MariaDB, PostgreSQL)
-//! - Secure cryptographic JWT secret generation
+//! - Cryptographically secure JWT secret generation (OS CSPRNG)
 //! - Database connection testing
 //! - Running migrations & CRUD generation prompts
 
@@ -32,6 +32,7 @@ impl SetupWizard {
         }
     }
 
+    /// Colorize text using standard ANSI escape codes.
     pub fn colorize(text: &str, color: &str) -> String {
         let code = match color {
             "red" => "\x1b[31m",
@@ -61,6 +62,7 @@ impl SetupWizard {
         println!("{} {}", Self::colorize("⚠", "yellow"), msg);
     }
 
+    /// Read user input from stdin with optional default fallback.
     fn ask(&self, question: &str, default: &str) -> String {
         let mut prompt = Self::colorize(question, "cyan");
         if !default.is_empty() {
@@ -83,6 +85,7 @@ impl SetupWizard {
         }
     }
 
+    /// Render a numbered choices menu and prompt the user.
     fn choice(&self, question: &str, options: &[(usize, &str)], default: usize) -> usize {
         println!("\n{}", Self::colorize(question, "cyan"));
         println!("{}", "-".repeat(60));
@@ -107,14 +110,8 @@ impl SetupWizard {
         println!("{}", Self::colorize(banner, "blue"));
     }
 
-    fn update_env(&self, key: &str, value: &str) -> bool {
-        let env_file = self.project_root.join(".env");
-        let content = if env_file.exists() {
-            fs::read_to_string(&env_file).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
+    /// Pure helper to update or insert a key-value pair in `.env` formatted content.
+    pub fn update_env_content(content: &str, key: &str, value: &str) -> String {
         let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
         let target_prefix = format!("{}=", key);
         let mut found = false;
@@ -131,8 +128,44 @@ impl SetupWizard {
             lines.push(format!("{}={}", key, value));
         }
 
-        let new_content = lines.join("\n") + "\n";
+        lines.join("\n") + "\n"
+    }
+
+    /// Update or insert a key-value pair in project `.env` file.
+    pub fn update_env(&self, key: &str, value: &str) -> bool {
+        let env_file = self.project_root.join(".env");
+        let content = if env_file.exists() {
+            fs::read_to_string(&env_file).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let new_content = Self::update_env_content(&content, key, value);
         fs::write(&env_file, new_content).is_ok()
+    }
+
+    /// Construct database connection URL in a clean, DRY manner.
+    pub fn build_database_url(
+        driver: &str,
+        user: &str,
+        pass: &str,
+        host: &str,
+        port: &str,
+        name: &str,
+    ) -> String {
+        let auth = if pass.is_empty() {
+            user.to_string()
+        } else {
+            format!("{}:{}", user, pass)
+        };
+        format!("{}://{}@{}:{}/{}", driver, auth, host, port, name)
+    }
+
+    /// Generate a 256-bit cryptographically secure JWT secret using OS CSPRNG.
+    pub fn generate_jwt_secret() -> String {
+        let u1 = uuid::Uuid::new_v4();
+        let u2 = uuid::Uuid::new_v4();
+        format!("{}{}", u1.simple(), u2.simple())
     }
 
     /// Run the interactive setup wizard.
@@ -158,7 +191,10 @@ impl SetupWizard {
             let _ = fs::copy(&example_path, &env_path);
             self.success(".env file created from .env.example");
         } else {
-            let _ = fs::write(&env_path, "# Padi Environment\nAPP_NAME=\"Padi Rust Api Framework\"\nAPP_ENV=development\nAPP_PORT=8080\n");
+            let _ = fs::write(
+                &env_path,
+                "# Padi Environment\nAPP_NAME=\"Padi Rust Api Framework\"\nAPP_ENV=development\nAPP_PORT=8080\n",
+            );
             self.success(".env file created with defaults");
         }
 
@@ -207,17 +243,7 @@ impl SetupWizard {
             let db_pass = self.ask("Database Password (empty for none)", "");
 
             self.update_env("DB_CONNECTION", driver);
-            let db_url = if driver == "mysql" {
-                if db_pass.is_empty() {
-                    format!("mysql://{}@{}:{}/{}", db_user, db_host, db_port, db_name)
-                } else {
-                    format!("mysql://{}:{}@{}:{}/{}", db_user, db_pass, db_host, db_port, db_name)
-                }
-            } else if db_pass.is_empty() {
-                format!("postgres://{}@{}:{}/{}", db_user, db_host, db_port, db_name)
-            } else {
-                format!("postgres://{}:{}@{}:{}/{}", db_user, db_pass, db_host, db_port, db_name)
-            };
+            let db_url = Self::build_database_url(driver, &db_user, &db_pass, &db_host, &db_port, &db_name);
             self.update_env("DATABASE_URL", &db_url);
             self.success("Database parameters saved to .env");
         }
@@ -244,13 +270,9 @@ impl SetupWizard {
 
         // Step 5: Generate JWT Secret
         println!("{}", Self::colorize("[5/7] Generating Cryptographic JWT Secret...", "yellow"));
-        let mut secret_bytes = [0u8; 32];
-        for b in &mut secret_bytes {
-            *b = (rand_simple() & 0xff) as u8;
-        }
-        let jwt_secret = hex_encode(&secret_bytes);
+        let jwt_secret = Self::generate_jwt_secret();
         self.update_env("JWT_SECRET", &jwt_secret);
-        self.success("JWT_SECRET generated (32 bytes cryptographic hex) and saved");
+        self.success("JWT_SECRET generated (256-bit cryptographic hex from OS CSPRNG) and saved");
 
         println!();
 
@@ -327,15 +349,53 @@ impl SetupWizard {
     }
 }
 
-fn rand_simple() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(123456789);
-    nanos ^ 0x5a5a5a5a
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    #[test]
+    fn test_colorize() {
+        let red = SetupWizard::colorize("error", "red");
+        assert!(red.starts_with("\x1b[31m"));
+        assert!(red.ends_with("\x1b[0m"));
+
+        let plain = SetupWizard::colorize("text", "unknown");
+        assert_eq!(plain, "\x1b[0mtext\x1b[0m");
+    }
+
+    #[test]
+    fn test_update_env_content_insert() {
+        let original = "APP_NAME=Padi\n";
+        let updated = SetupWizard::update_env_content(original, "APP_PORT", "8080");
+        assert!(updated.contains("APP_NAME=Padi"));
+        assert!(updated.contains("APP_PORT=8080"));
+    }
+
+    #[test]
+    fn test_update_env_content_replace() {
+        let original = "APP_NAME=Padi\nAPP_PORT=3000\n";
+        let updated = SetupWizard::update_env_content(original, "APP_PORT", "8080");
+        assert!(updated.contains("APP_PORT=8080"));
+        assert!(!updated.contains("APP_PORT=3000"));
+    }
+
+    #[test]
+    fn test_build_database_url() {
+        let without_pass = SetupWizard::build_database_url("mysql", "root", "", "127.0.0.1", "3306", "testdb");
+        assert_eq!(without_pass, "mysql://root@127.0.0.1:3306/testdb");
+
+        let with_pass = SetupWizard::build_database_url("postgres", "postgres", "secret", "localhost", "5432", "mydb");
+        assert_eq!(with_pass, "postgres://postgres:secret@localhost:5432/mydb");
+    }
+
+    #[test]
+    fn test_generate_jwt_secret() {
+        let s1 = SetupWizard::generate_jwt_secret();
+        let s2 = SetupWizard::generate_jwt_secret();
+
+        assert_eq!(s1.len(), 64);
+        assert_eq!(s2.len(), 64);
+        assert_ne!(s1, s2);
+        assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

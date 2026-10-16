@@ -1,4 +1,4 @@
-//! Email Helper - Send emails via SMTP (port of Email.php).
+//! Email Helper - Send emails asynchronously via SMTP.
 use std::{fs, path::Path};
 
 use lettre::{

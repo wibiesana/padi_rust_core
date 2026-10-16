@@ -1,27 +1,11 @@
-//! Cache - L1 memory + L2 file driver (port of Cache.php).
+//! Cache - L1 in-memory + L2 file cache driver for Padi Rust Api Framework.
 //!
-//! CACHE_DRIVER=file|memory (default file), CACHE_DIR (default `storage/cache`),
-//! CACHE_TTL (default 300), CACHE_L1_MAX (default 1000 entries),
-//! CACHE_L1_MAX_MEMORY_MB (default 64, 0 = disabled).
-//! Values are JSON-only. File keys are SHA-256 hashed and bucketed in 256 sub-dirs
-//! (`xx/<hash>.cache`), writes are atomic (tmp + rename).
-//!
-//! PHP -> Rust mapping:
-//!
-//! | PHP                     | Rust                                   |
-//! |-------------------------|----------------------------------------|
-//! | `get($key, $default)`   | `get` (Option) / `get_or`              |
-//! | `set($key,$v,$ttl)`     | `set` (ttl `None` = default, `Some(0)` = forever) |
-//! | `has`                   | `has`                                  |
-//! | `delete / deleteMany`   | `delete` (alias `forget`) / `delete_many` |
-//! | `clear`                 | `clear` (alias `flush`)                |
-//! | `remember`              | `remember` (async) / `remember_sync`   |
-//! | `increment / decrement` | `increment / decrement`                |
-//! | `cleanup`               | `cleanup`                              |
-//! | `reset / clearMemory / getMemorySize` | `reset / clear_memory / memory_size` |
-//!
-//! Redis (`CACHE_DRIVER=redis`) is not included: like PHP without a Redis
-//! client installed, it logs once and falls back to the file driver.
+//! Configuration options:
+//! - `CACHE_DRIVER`: `file` (default) or `memory`
+//! - `CACHE_DIR`: Cache directory path (default `storage/cache`)
+//! - `CACHE_TTL`: Default expiration in seconds (default 300)
+//! - `CACHE_L1_MAX`: Maximum in-memory entries (default 1000)
+//! - `CACHE_L1_MAX_MEMORY_MB`: Maximum in-memory size in MB (default 64)
 use std::{
     collections::HashMap,
     fs,
@@ -30,13 +14,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock, RwLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::env;
+use crate::{env, now_secs as now};
 
 struct Entry {
     value: Value,
@@ -45,10 +29,6 @@ struct Entry {
     /// Insertion sequence (oldest-first eviction).
     seq: u64,
     size: usize,
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn memory() -> &'static RwLock<HashMap<String, Entry>> {

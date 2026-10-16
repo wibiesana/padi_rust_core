@@ -1,4 +1,4 @@
-//! Console CLI (port of Console.php).
+//! Console CLI for Padi Rust Api Framework.
 //!
 //! Handles CLI commands, delegating code generation to `Generator`,
 //! queue processing to `Queue`, migrations to `Migrator`, and setup to `SetupWizard`.
