@@ -193,7 +193,7 @@ impl SetupWizard {
         } else {
             let _ = fs::write(
                 &env_path,
-                "# Padi Environment\nAPP_NAME=\"Padi Rust Api Framework\"\nAPP_ENV=development\nAPP_PORT=8080\n",
+                "# Padi Environment\nAPP_NAME=\"Padi Rust Api Framework\"\nAPP_ENV=development\nAPP_PORT=8085\n",
             );
             self.success(".env file created with defaults");
         }
@@ -340,7 +340,7 @@ impl SetupWizard {
         println!("{}", Self::colorize(box_header, "green"));
         println!("{}", Self::colorize("Next Steps:", "blue"));
         println!("  1. Run the server:      {}", Self::colorize("cargo run", "yellow"));
-        println!("  2. Visit API:           {}", Self::colorize("http://localhost:8080", "yellow"));
+        println!("  2. Visit API:           {}", Self::colorize("http://localhost:8085", "yellow"));
         println!("  3. Generate CRUD:       {}", Self::colorize("cargo run -- generate:crud <table_name>", "yellow"));
         println!("  4. Run migrations:      {}", Self::colorize("cargo run -- migrate", "yellow"));
         println!("\n{}", Self::colorize("Happy coding! 🚀", "green"));

@@ -34,7 +34,7 @@ impl Console {
             "make:controller" | "create:controller" => {
                 let name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
                 if let Some(name) = name {
-                    generator.generate_controller(name, force)?;
+                    generator.generate_controller(name, force).await?;
                 } else {
                     eprintln!("\x1b[31mError: Controller name is required.\x1b[0m");
                     println!("Usage: padi make:controller <name>");
@@ -201,7 +201,7 @@ impl Console {
         println!("  \x1b[32mmake:model\x1b[0m <table_name>   Create a new model from database table");
         println!("  \x1b[32mmake:resource\x1b[0m <name>        Create a new API resource");
         println!("  \x1b[32mmake:migration\x1b[0m <name>       Create a new SQL migration file");
-        println!("  \x1b[32mmake:collection\x1b[0m [table]      Generate or update api_collection.json");
+        println!("  \x1b[32mmake:collection\x1b[0m [table]      Generate API Collection (api_collection/<table_name>_collection.json)");
 
         println!("\n \x1b[33mmigrate\x1b[0m");
         println!("  \x1b[32mmigrate\x1b[0m                     Run pending migrations (--tables=users,posts)");

@@ -59,6 +59,7 @@ pub struct ApiResponse {
     pub data: Value,
     pub message: String,
     pub headers: HashMap<String, String>,
+    pub created_at: std::time::Instant,
 }
 
 pub fn ok(data: impl Serialize) -> ApiResult {
@@ -80,6 +81,7 @@ impl ApiResponse {
             data: serde_json::to_value(data).unwrap_or(Value::Null),
             message: "Success".into(),
             headers: HashMap::new(),
+            created_at: std::time::Instant::now(),
         }
     }
 
@@ -105,30 +107,66 @@ fn is_collection(v: &Value) -> bool {
 
 fn format_body(r: &ApiResponse) -> Value {
     let format = env::get_or("RESPONSE_FORMAT", "full").to_lowercase();
+    let mut map = serde_json::Map::new();
+
     match format.as_str() {
-        "raw" => r.data.clone(),
+        "raw" => return r.data.clone(),
         "simple" => {
-            if r.data.get("status").is_some() {
-                r.data.clone()
+            if let Value::Object(o) = &r.data {
+                if o.contains_key("status") {
+                    map = o.clone();
+                } else {
+                    map.insert("status".to_string(), json!("success"));
+                    map.insert("code".to_string(), json!(status_code_name(r.status)));
+                    map.insert("item".to_string(), r.data.clone());
+                }
             } else {
-                json!({"status": "success", "code": status_code_name(r.status), "item": r.data})
+                map.insert("status".to_string(), json!("success"));
+                map.insert("code".to_string(), json!(status_code_name(r.status)));
+                map.insert("item".to_string(), r.data.clone());
             }
         }
         _ => {
-            if r.data.get("success").is_some() {
-                return r.data.clone();
+            if let Value::Object(o) = &r.data {
+                if o.contains_key("success") || o.contains_key("message") {
+                    map = o.clone();
+                } else {
+                    map.insert("message".to_string(), json!(r.message));
+                    map.insert("message_code".to_string(), json!(status_code_name(r.status)));
+                    map.insert("success".to_string(), json!(true));
+                    if is_collection(&r.data) || !r.data.is_null() {
+                        map.insert("item".to_string(), r.data.clone());
+                    }
+                }
+            } else {
+                map.insert("message".to_string(), json!(r.message));
+                map.insert("message_code".to_string(), json!(status_code_name(r.status)));
+                map.insert("success".to_string(), json!(true));
+                if is_collection(&r.data) || !r.data.is_null() {
+                    map.insert("item".to_string(), r.data.clone());
+                }
             }
-            let mut body = json!({
-                "success": true,
-                "message": r.message,
-                "message_code": status_code_name(r.status),
-            });
-            if is_collection(&r.data) || !r.data.is_null() {
-                body["item"] = r.data.clone();
-            }
-            body
         }
     }
+
+    if env::is_debug() || env::get_or("APP_ENV", "production") == "development" {
+        let elapsed_str = crate::application::REQUEST_START
+            .try_with(|s| format!("{:.2}ms", s.elapsed().as_secs_f64() * 1000.0))
+            .unwrap_or_else(|_| format!("{:.2}ms", r.created_at.elapsed().as_secs_f64() * 1000.0));
+
+        map.insert(
+            "debug".to_string(),
+            json!({
+                "env": env::get_or("APP_ENV", "development"),
+                "execution_time": elapsed_str,
+                "queries_count": crate::database::Database::query_count(),
+                "queries": crate::database::Database::queries(),
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+        );
+    }
+
+    Value::Object(map)
 }
 
 /// Generate Axum Response with JSON body and proper Content-Type headers.
@@ -350,6 +388,21 @@ mod tests {
         let val = format_body(&resp);
         assert_eq!(val["success"], true);
         assert_eq!(val["item"]["id"], 1);
+    }
+
+    #[test]
+    fn test_api_response_debug_in_dev() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("APP_DEBUG", "true");
+        let resp = ok(json!({"id": 2})).unwrap();
+        let val = format_body(&resp);
+        assert_eq!(val["success"], true);
+        assert!(val.get("debug").is_some());
+        assert_eq!(val["debug"]["env"], "development");
+        assert!(val["debug"].get("execution_time").is_some());
+        assert!(val["debug"].get("queries_count").is_some());
+        assert!(val["debug"].get("queries").is_some());
+        assert!(val["debug"].get("timestamp").is_some());
     }
 
     #[test]

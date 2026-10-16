@@ -67,6 +67,36 @@ impl From<&Value> for Val {
 }
 impl From<Value> for Val { fn from(v: Value) -> Self { (&v).into() } }
 
+impl From<&Val> for Value {
+    fn from(v: &Val) -> Self {
+        match v {
+            Val::Null => Value::Null,
+            Val::Bool(b) => Value::Bool(*b),
+            Val::Int(i) => json!(i),
+            Val::Float(f) => json!(f),
+            Val::Str(s) => Value::String(s.clone()),
+        }
+    }
+}
+impl From<Val> for Value {
+    fn from(v: Val) -> Self {
+        (&v).into()
+    }
+}
+
+/// A recorded SQL query profile entry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryLog {
+    pub sql: String,
+    pub bindings: Vec<Value>,
+    pub duration: String,
+    pub duration_ms: f64,
+}
+
+tokio::task_local! {
+    pub static REQUEST_QUERIES: std::sync::Arc<std::sync::Mutex<Vec<QueryLog>>>;
+}
+
 /// Validate whether an identifier is safe (alphanumeric, underscores, dots).
 #[inline]
 pub fn is_valid_ident(s: &str) -> bool {
@@ -121,8 +151,36 @@ impl Database {
         *SQLITE.get().unwrap_or(&false)
     }
 
+    fn record_query(sql: &str, params: &[Val], start: std::time::Instant) {
+        QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+        let duration = start.elapsed();
+        let ms = (duration.as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+        let _ = REQUEST_QUERIES.try_with(|cell| {
+            if let Ok(mut logs) = cell.lock() {
+                logs.push(QueryLog {
+                    sql: sql.to_string(),
+                    bindings: params.iter().map(Value::from).collect(),
+                    duration: format!("{:.2}ms", ms),
+                    duration_ms: ms,
+                });
+            }
+        });
+    }
+
     pub fn query_count() -> u64 {
+        REQUEST_QUERIES.try_with(|cell| {
+            cell.lock().map(|logs| logs.len() as u64).unwrap_or(0)
+        }).unwrap_or_else(|_| QUERY_COUNT.load(Ordering::Relaxed))
+    }
+
+    pub fn total_query_count() -> u64 {
         QUERY_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub fn queries() -> Vec<QueryLog> {
+        REQUEST_QUERIES.try_with(|cell| {
+            cell.lock().map(|logs| logs.clone()).unwrap_or_default()
+        }).unwrap_or_default()
     }
 
     /// Rewrite `?` placeholders to `$n` for PostgreSQL.
@@ -163,8 +221,10 @@ impl Database {
 
     pub async fn fetch_all(sql: &str, params: &[Val]) -> Result<Vec<Value>, ApiError> {
         let sql = Self::prepare(sql);
-        QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
-        let rows = Self::bind_all(&sql, params).fetch_all(Self::pool()?).await?;
+        let start = std::time::Instant::now();
+        let res = Self::bind_all(&sql, params).fetch_all(Self::pool()?).await;
+        Self::record_query(&sql, params, start);
+        let rows = res?;
         Ok(rows.iter().map(row_to_json).collect())
     }
 
@@ -175,8 +235,10 @@ impl Database {
     /// Returns (rows_affected, last_insert_id when the driver supports it).
     pub async fn execute(sql: &str, params: &[Val]) -> Result<(u64, Option<i64>), ApiError> {
         let sql = Self::prepare(sql);
-        QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
-        let r = Self::bind_all(&sql, params).execute(Self::pool()?).await?;
+        let start = std::time::Instant::now();
+        let res = Self::bind_all(&sql, params).execute(Self::pool()?).await;
+        Self::record_query(&sql, params, start);
+        let r = res?;
         Ok((r.rows_affected(), r.last_insert_id()))
     }
 }

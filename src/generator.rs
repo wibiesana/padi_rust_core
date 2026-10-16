@@ -29,6 +29,16 @@ pub const PROTECTED_TABLES: &[&str] = &[
     "jobs",
 ];
 
+#[derive(Debug, Clone)]
+pub struct DetectedRelation {
+    pub column: String,
+    pub relation_name: String,
+    pub target_table: String,
+    pub target_const: String,
+    pub target_pk: String,
+    pub display_col: String,
+}
+
 pub struct Generator {
     pub base_dir: PathBuf,
 }
@@ -110,6 +120,122 @@ impl Generator {
             .collect()
     }
 
+    /// Introspect table foreign key relations based on DB foreign key constraints AND table structure.
+    pub async fn get_table_relations(&self, table_name: &str) -> Vec<DetectedRelation> {
+        let mut relations = Vec::new();
+        let all_tables = self.get_all_tables().await;
+
+        // 1. Check database foreign key metadata from DB schema
+        let fk_rows = if Database::is_sqlite() {
+            Database::fetch_all(&format!("PRAGMA foreign_key_list({})", table_name), &[]).await.unwrap_or_default()
+        } else if Database::is_postgres() {
+            let sql = "SELECT kcu.column_name AS \"from\", ccu.table_name AS \"table\", ccu.column_name AS \"to\" \
+                       FROM information_schema.table_constraints AS tc \
+                       JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+                       JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema \
+                       WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = ?";
+            Database::fetch_all(sql, &[Val::from(table_name)]).await.unwrap_or_default()
+        } else {
+            // MySQL
+            let sql = "SELECT COLUMN_NAME AS `from`, REFERENCED_TABLE_NAME AS `table`, REFERENCED_COLUMN_NAME AS `to` \
+                       FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+                       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL";
+            Database::fetch_all(sql, &[Val::from(table_name)]).await.unwrap_or_default()
+        };
+
+        let mut handled_cols = std::collections::HashSet::new();
+
+        for r in fk_rows {
+            let from_col = r.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let target_tbl = r.get("table").and_then(|v| v.as_str()).unwrap_or("");
+            let to_col = r.get("to").and_then(|v| v.as_str()).unwrap_or("id");
+
+            if !from_col.is_empty() && !target_tbl.is_empty() {
+                let rel_name = from_col.strip_suffix("_id").unwrap_or(from_col).to_string();
+                let target_const = Self::screaming_snake_case(target_tbl);
+                
+                // Introspect target table to pick best display column (name > username > title)
+                let target_cols = self.get_table_columns(target_tbl).await;
+                let display_col = if target_cols.iter().any(|c| c == "name") {
+                    "name"
+                } else if target_cols.iter().any(|c| c == "username") {
+                    "username"
+                } else if target_cols.iter().any(|c| c == "title") {
+                    "title"
+                } else {
+                    "id"
+                };
+
+                relations.push(DetectedRelation {
+                    column: from_col.to_string(),
+                    relation_name: rel_name,
+                    target_table: target_tbl.to_string(),
+                    target_const,
+                    target_pk: to_col.to_string(),
+                    display_col: display_col.to_string(),
+                });
+                handled_cols.insert(from_col.to_string());
+            }
+        }
+
+        // 2. Inferred relations from table columns and database structure
+        let cols = self.get_table_columns(table_name).await;
+        for col in cols {
+            if handled_cols.contains(&col) || matches!(col.as_str(), "id" | "created_at" | "updated_at" | "created_by" | "updated_by") {
+                continue;
+            }
+
+            // Check if column is `xxx_id` OR matches another table name / singular table name (e.g. `user`, `author`, `category`)
+            let candidate_table = if let Some(stem) = col.strip_suffix("_id") {
+                let plural = Self::pluralize(stem);
+                if all_tables.iter().any(|t| t == &plural) {
+                    Some(plural)
+                } else if all_tables.iter().any(|t| t == stem) {
+                    Some(stem.to_string())
+                } else {
+                    None
+                }
+            } else {
+                // Column without _id, e.g. "user" or "author" or "category"
+                let plural = Self::pluralize(&col);
+                if all_tables.iter().any(|t| t == &plural) {
+                    Some(plural)
+                } else if all_tables.iter().any(|t| t == &col) {
+                    Some(col.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(target_tbl) = candidate_table {
+                let rel_name = col.strip_suffix("_id").unwrap_or(&col).to_string();
+                let target_const = Self::screaming_snake_case(&target_tbl);
+                let target_cols = self.get_table_columns(&target_tbl).await;
+                let display_col = if target_cols.iter().any(|c| c == "name") {
+                    "name"
+                } else if target_cols.iter().any(|c| c == "username") {
+                    "username"
+                } else if target_cols.iter().any(|c| c == "title") {
+                    "title"
+                } else {
+                    "id"
+                };
+
+                relations.push(DetectedRelation {
+                    column: col.clone(),
+                    relation_name: rel_name,
+                    target_table: target_tbl,
+                    target_const,
+                    target_pk: "id".to_string(),
+                    display_col: display_col.to_string(),
+                });
+                handled_cols.insert(col);
+            }
+        }
+
+        relations
+    }
+
     /// Normalize an input name (e.g. `Product`, `products`, `OrderItem`, `order_items`)
     /// into `(table_name, singular_file_stem, struct_name, const_name, plural_file_stem)`.
     pub fn normalize_names(input: &str) -> (String, String, String, String, String) {
@@ -132,7 +258,7 @@ impl Generator {
         (table_name, singular, struct_name, const_name, plural)
     }
 
-    /// Generate Model with column introspection and automatic `mod.rs` re-export.
+    /// Generate Model with Two-Tier Architecture (base/ and concrete).
     pub async fn generate_model(&self, name: &str, force: bool) -> Result<(), ApiError> {
         let (table_name, singular, _struct_name, const_name, _plural) = Self::normalize_names(name);
 
@@ -141,17 +267,6 @@ impl Generator {
                 "\x1b[33m⚠️ Table '{}' is a protected core table. Skipping model generation.\x1b[0m",
                 table_name
             );
-            return Ok(());
-        }
-
-        let file_stem = &singular;
-        let path = self
-            .base_dir
-            .join("src/models")
-            .join(format!("{}.rs", file_stem));
-
-        if path.exists() && !force {
-            eprintln!("\x1b[33mWarning: Model already exists at {:?}\x1b[0m", path);
             return Ok(());
         }
 
@@ -167,11 +282,44 @@ impl Generator {
             })
             .collect();
 
-        let content = if fillable.is_empty() {
+        // Introspect relations
+        let relations = self.get_table_relations(&table_name).await;
+        let mut rel_chains = String::new();
+        if !relations.is_empty() {
+            let rel_lines: Vec<String> = relations
+                .iter()
+                .map(|r| {
+                    format!(
+                        "        Relation::belongs_to(\"{}\", || crate::models::{}, \"{}\", \"{}\")\n            .columns(&[\"id\", \"{}\"]),",
+                        r.relation_name, r.target_const, r.column, r.target_pk, r.display_col
+                    )
+                })
+                .collect();
+            let with_items: Vec<String> = relations
+                .iter()
+                .map(|r| format!("\"{}\"", r.relation_name))
+                .collect();
+            rel_chains = format!(
+                "\n    .relations(&[\n{}\n    ])\n    .default_with(&[{}])",
+                rel_lines.join("\n"),
+                with_items.join(", ")
+            );
+        }
+
+        // 1. Tier 1: Base Model (ALWAYS regenerated/overwritten)
+        let base_path = self
+            .base_dir
+            .join("src/models/base")
+            .join(format!("{}_base.rs", singular));
+
+        let base_content = if fillable.is_empty() {
             format!(
                 r#"use padi_core::prelude::*;
 
-pub const {const_name}: Model = Model::new("{table_name}");
+/// Base model for table `{table_name}`.
+/// Auto-generated by Padi Framework. DO NOT EDIT DIRECTLY.
+/// This file is regenerated on every code generation.
+pub const BASE_{const_name}: Model = Model::new("{table_name}"){rel_chains};
 "#
             )
         } else {
@@ -183,20 +331,45 @@ pub const {const_name}: Model = Model::new("{table_name}");
             format!(
                 r#"use padi_core::prelude::*;
 
-pub const {const_name}: Model = Model::new("{table_name}")
-    .fillable(&[{fillable_repr}]);
+/// Base model for table `{table_name}`.
+/// Auto-generated by Padi Framework. DO NOT EDIT DIRECTLY.
+/// This file is regenerated on every code generation.
+pub const BASE_{const_name}: Model = Model::new("{table_name}")
+    .fillable(&[{fillable_repr}]){rel_chains};
 "#
             )
         };
 
-        Self::write_file(&path, content)?;
-        Self::update_models_mod_rs(&self.base_dir, file_stem, &const_name)?;
-        println!("\x1b[32m✓ Model created:\x1b[0m {:?}", path);
+        Self::write_file(&base_path, base_content)?;
+        Self::update_models_mod_rs(&self.base_dir, &singular, &const_name)?;
+        println!("\x1b[32m✓ Base Model generated (overwritten):\x1b[0m {:?}", base_path);
+
+        // 2. Tier 2: Concrete Model (Generated once, NEVER overwritten)
+        let concrete_path = self
+            .base_dir
+            .join("src/models")
+            .join(format!("{}.rs", singular));
+
+        if concrete_path.exists() {
+            println!(
+                "\x1b[33mℹ Concrete model already exists at {:?}. Preserving custom logic.\x1b[0m",
+                concrete_path
+            );
+        } else {
+            let concrete_content = format!(
+                r#"pub use super::base::{singular}_base::BASE_{const_name} as {const_name};
+
+// Add custom business logic, custom queries, hooks, and relationships below:
+"#
+            );
+            Self::write_file(&concrete_path, concrete_content)?;
+            println!("\x1b[32m✓ Concrete Model created:\x1b[0m {:?}", concrete_path);
+        }
 
         Ok(())
     }
 
-    /// Generate API Resource with automatic `mod.rs` re-export.
+    /// Generate API Resource without base; if already exists, NEVER overwrite it.
     pub async fn generate_resource(&self, name: &str, force: bool) -> Result<(), ApiError> {
         let (table_name, singular, struct_name, _const_name, _plural) = Self::normalize_names(name);
 
@@ -215,12 +388,17 @@ pub const {const_name}: Model = Model::new("{table_name}")
             .join("src/resources")
             .join(format!("{}.rs", file_stem));
 
-        if path.exists() && !force {
-            eprintln!("\x1b[33mWarning: Resource already exists at {:?}\x1b[0m", path);
+        if path.exists() {
+            println!(
+                "\x1b[33mℹ Resource already exists at {:?}. Preserving existing custom resource.\x1b[0m",
+                path
+            );
             return Ok(());
         }
 
         let cols = self.get_table_columns(&table_name).await;
+        let relations = self.get_table_relations(&table_name).await;
+
         let content = if cols.is_empty() {
             format!(
                 r#"use padi_core::prelude::*;
@@ -237,7 +415,16 @@ impl Resource for {resource_struct} {{
         } else {
             let shape_entries = cols
                 .iter()
-                .map(|c| format!("            \"{}\": item[\"{}\"],", c, c))
+                .map(|c| {
+                    if let Some(rel) = relations.iter().find(|r| &r.column == c) {
+                        format!(
+                            "            \"{}\": when_loaded(item, \"{}\").unwrap_or_else(|| json!({{ \"id\": item[\"{}\"] }})),",
+                            rel.relation_name, rel.relation_name, c
+                        )
+                    } else {
+                        format!("            \"{}\": item[\"{}\"],", c, c)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -260,12 +447,11 @@ impl Resource for {resource_struct} {{
         Self::write_file(&path, content)?;
         Self::update_resources_mod_rs(&self.base_dir, file_stem, &resource_struct)?;
         println!("\x1b[32m✓ Resource created:\x1b[0m {:?}", path);
-
         Ok(())
     }
 
-    /// Generate Controller with standard CRUD operations and automatic `mod.rs` registration.
-    pub fn generate_controller(&self, name: &str, force: bool) -> Result<(), ApiError> {
+    /// Generate Controller with Two-Tier Architecture (base/ and concrete) and automatic input validation.
+    pub async fn generate_controller(&self, name: &str, force: bool) -> Result<(), ApiError> {
         let (table_name, _singular, struct_name, const_name, plural) = Self::normalize_names(name);
 
         if Self::is_protected_table(&table_name) && !force {
@@ -276,21 +462,95 @@ impl Resource for {resource_struct} {{
             return Ok(());
         }
 
-        let file_stem = &plural;
-        let path = self
-            .base_dir
-            .join("src/controllers")
-            .join(format!("{}.rs", file_stem));
+        // Introspect table columns to build validation rules
+        let cols = self.get_table_columns(&table_name).await;
+        let mut store_rules = Vec::new();
+        let mut update_rules = Vec::new();
 
-        if path.exists() && !force {
-            eprintln!("\x1b[33mWarning: Controller already exists at {:?}\x1b[0m", path);
-            return Ok(());
+        for col in &cols {
+            let c_lower = col.to_ascii_lowercase();
+            if matches!(c_lower.as_str(), "id" | "created_at" | "updated_at" | "created_by" | "updated_by") {
+                continue;
+            }
+
+            let (store_rule, update_rule) = if c_lower.contains("email") {
+                ("required|email", "sometimes|email")
+            } else if c_lower.contains("password") {
+                ("required|string|min:8", "sometimes|string|min:8")
+            } else if c_lower.ends_with("_id") || c_lower.contains("count") || c_lower.contains("qty") || c_lower.contains("stock") || c_lower.contains("age") {
+                ("required|integer", "sometimes|integer")
+            } else if c_lower.contains("price") || c_lower.contains("amount") || c_lower.contains("cost") {
+                ("required|numeric", "sometimes|numeric")
+            } else if c_lower.contains("title") || c_lower.contains("name") {
+                ("required|string|min:2|max:255", "sometimes|string|min:2|max:255")
+            } else if c_lower.contains("slug") {
+                ("sometimes|string", "sometimes|string")
+            } else if c_lower.contains("status") {
+                ("sometimes|string", "sometimes|string")
+            } else {
+                ("required|string", "sometimes|string")
+            };
+
+            store_rules.push(format!("            (\"{}\", \"{}\"),", col, store_rule));
+            update_rules.push(format!("            (\"{}\", \"{}\"),", col, update_rule));
         }
 
-        let content = format!(
+        let store_body = if store_rules.is_empty() {
+            format!(
+                r#"    let item = {const_name}.create(&body).await?;
+    created({struct_name}Resource::wrap(&item))"#
+            )
+        } else {
+            let store_rules_str = store_rules.join("\n");
+            format!(
+                r#"    let data = Validator::new(
+        &body,
+        &[
+{store_rules_str}
+        ],
+    )
+    .validate()
+    .await?;
+    let item = {const_name}.create(&data).await?;
+    created({struct_name}Resource::wrap(&item))"#
+            )
+        };
+
+        let update_body = if update_rules.is_empty() {
+            format!(
+                r#"    let item = {const_name}.update(id, &body).await?;
+    ok({struct_name}Resource::wrap(&item))"#
+            )
+        } else {
+            let update_rules_str = update_rules.join("\n");
+            format!(
+                r#"    let data = Validator::new(
+        &body,
+        &[
+{update_rules_str}
+        ],
+    )
+    .validate()
+    .await?;
+    let item = {const_name}.update(id, &data).await?;
+    ok({struct_name}Resource::wrap(&item))"#
+            )
+        };
+
+        // 1. Tier 1: Base Controller (ALWAYS regenerated/overwritten)
+        let base_path = self
+            .base_dir
+            .join("src/controllers/base")
+            .join(format!("{}_base.rs", plural));
+
+        let base_content = format!(
             r#"use padi_core::prelude::*;
 
 use crate::{{models::{const_name}, resources::{struct_name}Resource}};
+
+/// Base controller for `{table_name}`.
+/// Auto-generated by Padi Framework. DO NOT EDIT DIRECTLY.
+/// This file is regenerated on every code generation.
 
 pub async fn index(_auth: AuthUser, p: Params) -> ApiResult {{
     let (page, per) = p.pagination();
@@ -306,13 +566,11 @@ pub async fn show(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
 }}
 
 pub async fn store(_auth: AuthUser, Body(body): Body) -> ApiResult {{
-    let item = {const_name}.create(&body).await?;
-    created({struct_name}Resource::wrap(&item))
+{store_body}
 }}
 
 pub async fn update(_auth: AuthUser, Path(id): Path<i64>, Body(body): Body) -> ApiResult {{
-    let item = {const_name}.update(id, &body).await?;
-    ok({struct_name}Resource::wrap(&item))
+{update_body}
 }}
 
 pub async fn destroy(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
@@ -322,9 +580,31 @@ pub async fn destroy(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
 "#
         );
 
-        Self::write_file(&path, content)?;
-        Self::update_controllers_mod_rs(&self.base_dir, file_stem)?;
-        println!("\x1b[32m✓ Controller created:\x1b[0m {:?}", path);
+        Self::write_file(&base_path, base_content)?;
+        Self::update_controllers_mod_rs(&self.base_dir, &plural)?;
+        println!("\x1b[32m✓ Base Controller generated (overwritten):\x1b[0m {:?}", base_path);
+
+        // 2. Tier 2: Concrete Controller (Generated once, NEVER overwritten)
+        let concrete_path = self
+            .base_dir
+            .join("src/controllers")
+            .join(format!("{}.rs", plural));
+
+        if concrete_path.exists() {
+            println!(
+                "\x1b[33mℹ Concrete controller already exists at {:?}. Preserving custom actions.\x1b[0m",
+                concrete_path
+            );
+        } else {
+            let concrete_content = format!(
+                r#"pub use super::base::{plural}_base::*;
+
+// Add or override custom action handlers below:
+"#
+            );
+            Self::write_file(&concrete_path, concrete_content)?;
+            println!("\x1b[32m✓ Concrete Controller created:\x1b[0m {:?}", concrete_path);
+        }
 
         Ok(())
     }
@@ -390,7 +670,6 @@ DROP TABLE IF EXISTS {table};
 
         Self::write_file(&path, template)?;
         println!("\x1b[32m✓ Migration created:\x1b[0m {:?}", path);
-
         Ok(())
     }
 
@@ -416,12 +695,10 @@ DROP TABLE IF EXISTS {table};
         self.generate_resource(name, force).await?;
 
         println!("\n3. Generating Controller...");
-        self.generate_controller(name, force)?;
+        self.generate_controller(name, force).await?;
 
         println!("\n4. Generating Route...");
-        self.generate_route(name, force)?;
-
-        println!("\n5. Updating API Collection...");
+                println!("\n5. Updating API Collection...");
         let _ = self.generate_api_collection(name, force).await;
 
         println!("\n{}", "=".repeat(60));
@@ -458,28 +735,27 @@ DROP TABLE IF EXISTS {table};
         Ok(())
     }
 
-    /// Generate or update Postman API Collection (api_collection.json) with standard endpoints for this table.
+    /// Generate or update API Collection for a table (api_collection/<table_name>_collection.json).
     pub async fn generate_api_collection(&self, name: &str, force: bool) -> Result<(), ApiError> {
         let (table_name, singular, struct_name, _const_name, plural) = Self::normalize_names(name);
-        let path = self.base_dir.join("api_collection.json");
-
-        let mut root: Value = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content).unwrap_or_else(|_| Self::default_api_collection_json())
-        } else {
-            Self::default_api_collection_json()
-        };
-
-        // Ensure variable has singular_id (e.g. product_id)
-        let id_var_key = format!("{}_id", singular);
-        if let Some(vars) = root.get_mut("variable").and_then(|v| v.as_array_mut()) {
-            if !vars.iter().any(|v| v.get("key").and_then(|k| k.as_str()) == Some(&id_var_key)) {
-                vars.push(json!({
-                    "key": id_var_key,
-                    "value": "1"
-                }));
-            }
+        
+        // Clean up legacy combined api_collection.json files if they exist
+        let legacy_path = self.base_dir.join("api_collection.json");
+        if legacy_path.exists() {
+            let _ = fs::remove_file(&legacy_path);
         }
+        let legacy_coll = self.base_dir.join("api_collection/api_collection.json");
+        if legacy_coll.exists() {
+            let _ = fs::remove_file(&legacy_coll);
+        }
+
+        let single_path = self.base_dir.join(format!("api_collection/{}_collection.json", table_name));
+        if single_path.exists() && !force {
+            println!("\x1b[33mℹ API Collection for '{}' already exists at {:?}. Skipping (use --force to overwrite).\x1b[0m", table_name, single_path);
+            return Ok(());
+        }
+
+        let id_var_key = format!("{}_id", singular);
 
         // Get table columns to create realistic dummy sample JSON body
         let cols = self.get_table_columns(&table_name).await;
@@ -527,145 +803,144 @@ DROP TABLE IF EXISTS {table};
             serde_json::to_string_pretty(&Value::Object(sample_update_obj)).unwrap_or_default()
         };
 
-        let next_idx = Self::next_item_index(&root);
-        let folder_title = format!("{}. {}", next_idx, Self::pascal_case(&plural));
         let test_script = format!(
             "try {{\n    if (pm.response.code === 201 || pm.response.code === 200) {{\n        const res = pm.response.json();\n        const id = res.data?.id || res.data?.{}?.id;\n        if (id) pm.collectionVariables.set('{}_id', id);\n    }}\n}} catch (e) {{ console.warn('Script bypassed'); }}",
             singular, singular
         );
 
-        let new_folder = json!({
-            "name": folder_title,
-            "item": [
-                {
-                    "name": format!("List {}", Self::pascal_case(&plural)),
-                    "request": {
-                        "method": "GET",
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}", plural)
+        let items = json!([
+            {
+                "name": format!("List {}", Self::pascal_case(&plural)),
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}", plural)
+                    }
+                }
+            },
+            {
+                "name": format!("List All {}", Self::pascal_case(&plural)),
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}/all", plural)
+                    }
+                }
+            },
+            {
+                "name": format!("Get {} By ID", struct_name),
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                    }
+                }
+            },
+            {
+                "name": format!("Create {}", struct_name),
+                "event": [
+                    {
+                        "listen": "test",
+                        "script": {
+                            "exec": test_script.lines().map(String::from).collect::<Vec<_>>(),
+                            "type": "text/javascript"
                         }
                     }
-                },
-                {
-                    "name": format!("List All {}", Self::pascal_case(&plural)),
-                    "request": {
-                        "method": "GET",
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}/all", plural)
-                        }
-                    }
-                },
-                {
-                    "name": format!("Get {} By ID", struct_name),
-                    "request": {
-                        "method": "GET",
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
-                        }
-                    }
-                },
-                {
-                    "name": format!("Create {}", struct_name),
-                    "event": [
+                ],
+                "request": {
+                    "method": "POST",
+                    "header": [
                         {
-                            "listen": "test",
-                            "script": {
-                                "exec": test_script.lines().map(String::from).collect::<Vec<_>>(),
-                                "type": "text/javascript"
-                            }
+                            "key": "Content-Type",
+                            "value": "application/json"
                         }
                     ],
-                    "request": {
-                        "method": "POST",
-                        "header": [
-                            {
-                                "key": "Content-Type",
-                                "value": "application/json"
-                            }
-                        ],
-                        "body": {
-                            "mode": "raw",
-                            "raw": create_body_raw
-                        },
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}", plural)
-                        }
-                    }
-                },
-                {
-                    "name": format!("Update {}", struct_name),
-                    "request": {
-                        "method": "PUT",
-                        "header": [
-                            {
-                                "key": "Content-Type",
-                                "value": "application/json"
-                            }
-                        ],
-                        "body": {
-                            "mode": "raw",
-                            "raw": update_body_raw
-                        },
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
-                        }
-                    }
-                },
-                {
-                    "name": format!("Delete {}", struct_name),
-                    "request": {
-                        "method": "DELETE",
-                        "url": {
-                            "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
-                        }
+                    "body": {
+                        "mode": "raw",
+                        "raw": create_body_raw
+                    },
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}", plural)
                     }
                 }
-            ]
+            },
+            {
+                "name": format!("Update {}", struct_name),
+                "request": {
+                    "method": "PUT",
+                    "header": [
+                        {
+                            "key": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ],
+                    "body": {
+                        "mode": "raw",
+                        "raw": update_body_raw
+                    },
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                    }
+                }
+            },
+            {
+                "name": format!("Delete {}", struct_name),
+                "request": {
+                    "method": "DELETE",
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                    }
+                }
+            }
+        ]);
+
+        // Generate separate individual collection file (1 file per table)
+        let single_collection = json!({
+            "info": {
+                "_postman_id": uuid::Uuid::new_v4().to_string(),
+                "name": format!("{} API", Self::pascal_case(&plural)),
+                "description": format!("API Collection for {} generated by Padi Rust Api Framework.", plural),
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "auth": {
+                "type": "bearer",
+                "bearer": [
+                    {
+                        "key": "token",
+                        "value": "{{auth_token}}",
+                        "type": "string"
+                    }
+                ]
+            },
+            "variable": [
+                { "key": "base_url", "value": "http://localhost:8085" },
+                { "key": "auth_token", "value": "" },
+                { "key": id_var_key, "value": "1" }
+            ],
+            "item": items
         });
 
-        let plural_suffix = Self::pascal_case(&plural);
-        let mut replaced = false;
-        if let Some(items) = root.get_mut("item").and_then(|i| i.as_array_mut()) {
-            for (idx, existing) in items.iter_mut().enumerate() {
-                if let Some(name) = existing.get("name").and_then(|n| n.as_str()) {
-                    let name_clean = name.trim();
-                    if name_clean == plural_suffix
-                        || name_clean.ends_with(&format!(". {}", plural_suffix))
-                        || name_clean.ends_with(&plural_suffix)
-                    {
-                        if !force {
-                            println!("\x1b[33mℹ API Collection folder for '{}' already exists. Skipping (use --force to overwrite).\x1b[0m", plural);
-                            return Ok(());
-                        }
-                        let mut folder_clone = new_folder.clone();
-                        folder_clone["name"] = json!(name);
-                        items[idx] = folder_clone;
-                        replaced = true;
-                        break;
-                    }
-                }
-            }
-            if !replaced {
-                items.push(new_folder);
-            }
-        }
-
-        let formatted = serde_json::to_string_pretty(&root).unwrap_or_default();
-        Self::write_file(&path, formatted)?;
-        println!("\x1b[32m✓ API Collection updated:\x1b[0m {:?} (Resource: {})", path, Self::pascal_case(&plural));
+        let single_formatted = serde_json::to_string_pretty(&single_collection).unwrap_or_default();
+        Self::write_file(&single_path, single_formatted)?;
+        println!("\x1b[32m✓ Single Table Collection saved:\x1b[0m {:?}", single_path);
 
         Ok(())
     }
 
     /// Generate or update API Collection for ALL tables discovered in the database.
     pub async fn generate_api_collection_all(&self, force: bool) -> Result<(), ApiError> {
-        let path = self.base_dir.join("api_collection.json");
-        if !path.exists() {
-            let default_root = Self::default_api_collection_json();
-            let formatted = serde_json::to_string_pretty(&default_root).unwrap_or_default();
-            Self::write_file(&path, formatted)?;
-            println!("\x1b[32m✓ API Collection initialized:\x1b[0m {:?} (Authentication & Users)", path);
+        let legacy_path = self.base_dir.join("api_collection.json");
+        if legacy_path.exists() {
+            let _ = fs::remove_file(&legacy_path);
         }
+        let legacy_coll = self.base_dir.join("api_collection/api_collection.json");
+        if legacy_coll.exists() {
+            let _ = fs::remove_file(&legacy_coll);
+        }
+
+        // Generate individual auth_collection.json and users_collection.json
+        Self::generate_default_auth_collection(&self.base_dir)?;
+        Self::generate_default_users_collection(&self.base_dir)?;
 
         let tables = self.get_all_tables().await;
         let mut count = 0;
@@ -679,8 +954,74 @@ DROP TABLE IF EXISTS {table};
         }
 
         if count > 0 {
-            println!("\x1b[32m✓ API Collection updated with {} custom table(s)!\x1b[0m", count);
+            println!("\x1b[32m✓ Individual API Collections generated for {} table(s)!\x1b[0m", count);
         }
+        Ok(())
+    }
+
+    pub fn generate_default_auth_collection(base_dir: &Path) -> Result<(), ApiError> {
+        let path = base_dir.join("api_collection/auth_collection.json");
+        let default_all = Self::default_api_collection_json();
+        let items = default_all
+            .get("item")
+            .and_then(|arr| arr.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|obj| obj.get("item"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+
+        let col = json!({
+            "info": {
+                "_postman_id": uuid::Uuid::new_v4().to_string(),
+                "name": "Auth API",
+                "description": "Authentication collection generated by Padi Rust Api Framework.",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "variable": [
+                { "key": "base_url", "value": "http://localhost:8085" },
+                { "key": "auth_token", "value": "" },
+                { "key": "user_id", "value": "1" }
+            ],
+            "item": items
+        });
+        let _ = Self::write_file(&path, serde_json::to_string_pretty(&col).unwrap_or_default());
+        println!("\x1b[32m✓ Single Table Collection saved:\x1b[0m {:?}", path);
+        Ok(())
+    }
+
+    pub fn generate_default_users_collection(base_dir: &Path) -> Result<(), ApiError> {
+        let path = base_dir.join("api_collection/users_collection.json");
+        let default_all = Self::default_api_collection_json();
+        let items = default_all
+            .get("item")
+            .and_then(|arr| arr.as_array())
+            .and_then(|arr| arr.get(1))
+            .and_then(|obj| obj.get("item"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+
+        let col = json!({
+            "info": {
+                "_postman_id": uuid::Uuid::new_v4().to_string(),
+                "name": "Users API",
+                "description": "Users CRUD collection generated by Padi Rust Api Framework.",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "auth": {
+                "type": "bearer",
+                "bearer": [
+                    { "key": "token", "value": "{{auth_token}}", "type": "string" }
+                ]
+            },
+            "variable": [
+                { "key": "base_url", "value": "http://localhost:8085" },
+                { "key": "auth_token", "value": "" },
+                { "key": "user_id", "value": "1" }
+            ],
+            "item": items
+        });
+        let _ = Self::write_file(&path, serde_json::to_string_pretty(&col).unwrap_or_default());
+        println!("\x1b[32m✓ Single Table Collection saved:\x1b[0m {:?}", path);
         Ok(())
     }
 
@@ -711,7 +1052,7 @@ DROP TABLE IF EXISTS {table};
                 ]
             },
             "variable": [
-                { "key": "base_url", "value": "http://localhost:8080" },
+                { "key": "base_url", "value": "http://localhost:8085" },
                 { "key": "auth_token", "value": "" },
                 { "key": "user_id", "value": "1" }
             ],
@@ -885,7 +1226,11 @@ DROP TABLE IF EXISTS {table};
         let mut content = if mod_path.exists() {
             fs::read_to_string(mod_path).unwrap_or_default()
         } else {
-            String::new()
+            let mut init = String::new();
+            if mod_path.to_string_lossy().contains("base") {
+                init.push_str("#![allow(unused_imports)]\n\n");
+            }
+            init
         };
 
         let pub_mod = format!("pub mod {};", module_name);
@@ -918,6 +1263,15 @@ DROP TABLE IF EXISTS {table};
         module_name: &str,
         const_name: &str,
     ) -> Result<(), ApiError> {
+        // 1. Ensure `pub mod base;` is declared in src/models/mod.rs
+        Self::ensure_mod_rs(&base_dir.join("src/models/mod.rs"), "base", None)?;
+        // 2. Ensure `pub mod <singular>_base;` and re-export in src/models/base/mod.rs
+        Self::ensure_mod_rs(
+            &base_dir.join("src/models/base/mod.rs"),
+            &format!("{}_base", module_name),
+            Some(&format!("BASE_{}", const_name)),
+        )?;
+        // 3. Ensure `pub mod <singular>;` and re-export in src/models/mod.rs
         Self::ensure_mod_rs(&base_dir.join("src/models/mod.rs"), module_name, Some(const_name))
     }
 
@@ -930,6 +1284,15 @@ DROP TABLE IF EXISTS {table};
     }
 
     fn update_controllers_mod_rs(base_dir: &Path, module_name: &str) -> Result<(), ApiError> {
+        // 1. Ensure `pub mod base;` is declared in src/controllers/mod.rs
+        Self::ensure_mod_rs(&base_dir.join("src/controllers/mod.rs"), "base", None)?;
+        // 2. Ensure `pub mod <plural>_base;` in src/controllers/base/mod.rs
+        Self::ensure_mod_rs(
+            &base_dir.join("src/controllers/base/mod.rs"),
+            &format!("{}_base", module_name),
+            None,
+        )?;
+        // 3. Ensure `pub mod <plural>;` in src/controllers/mod.rs
         Self::ensure_mod_rs(&base_dir.join("src/controllers/mod.rs"), module_name, None)
     }
 

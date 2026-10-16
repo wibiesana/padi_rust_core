@@ -110,6 +110,20 @@ async fn security_headers(development: bool, req: Request, next: Next) -> Respon
     res
 }
 
+tokio::task_local! {
+    pub static REQUEST_START: std::time::Instant;
+}
+
+async fn request_timing_layer(req: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    crate::database::REQUEST_QUERIES.scope(queries, async move {
+        REQUEST_START.scope(start, async move {
+            next.run(req).await
+        }).await
+    }).await
+}
+
 impl Application {
     /// `root` is the project directory (holding `.env`, `storage/`, `database/`).
     pub fn new(root: &str, router: Router) -> Self {
@@ -151,6 +165,7 @@ impl Application {
         let mut app = self
             .router
             .fallback(not_found)
+            .layer(middleware::from_fn(request_timing_layer))
             .layer(middleware::from_fn(move |req: Request, next: Next| async move {
                 security_headers(dev, req, next).await
             }))
@@ -171,11 +186,23 @@ impl Application {
         }
         Database::connect().await?;
 
-        let addr = format!("{}:{}", env::get_or("APP_HOST", "0.0.0.0"), env::get_or("APP_PORT", "8080"));
-        let listener = tokio::net::TcpListener::bind(&addr)
+        let host = env::get_or("APP_HOST", "0.0.0.0");
+        let port = env::get_or("APP_PORT", "8085");
+        let bind_addr = if host == "localhost" {
+            format!("127.0.0.1:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
-            .map_err(|e| ApiError::internal(format!("cannot bind {addr}: {e}")))?;
-        tracing::info!("Padi listening on http://{addr}");
+            .map_err(|e| ApiError::internal(format!("cannot bind {bind_addr}: {e}")))?;
+
+        let display_host = if host == "0.0.0.0" || host == "127.0.0.1" {
+            "localhost"
+        } else {
+            &host
+        };
+        tracing::info!("Padi listening on http://{display_host}:{port}");
 
         axum::serve(listener, self.build())
             .with_graceful_shutdown(async {
