@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Core engine for Padi REST API Framework (Rust)"
 license = "MIT"
+authors = ["Wibiesana <wibiesana@yahoo.com>"]
+repository = "https://github.com/wibiesana/padi_rust_core"
+homepage = "https://padisoftware.my.id"
+readme = "README.md"
+keywords = ["padi", "rest", "api", "framework", "axum"]
+categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 axum = "0.8"
