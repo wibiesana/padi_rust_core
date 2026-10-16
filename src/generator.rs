@@ -421,7 +421,7 @@ DROP TABLE IF EXISTS {table};
         println!("\n4. Generating Route...");
         self.generate_route(name, force)?;
 
-        println!("\n5. Updating Postman API Collection...");
+        println!("\n5. Updating API Collection...");
         let _ = self.generate_api_collection(name, force).await;
 
         println!("\n{}", "=".repeat(60));
@@ -659,17 +659,27 @@ DROP TABLE IF EXISTS {table};
 
     /// Generate or update API Collection for ALL tables discovered in the database.
     pub async fn generate_api_collection_all(&self, force: bool) -> Result<(), ApiError> {
-        let tables = self.get_all_tables().await;
-        if tables.is_empty() {
-            println!("\x1b[33mNo tables found in database.\x1b[0m");
-            return Ok(());
+        let path = self.base_dir.join("api_collection.json");
+        if !path.exists() {
+            let default_root = Self::default_api_collection_json();
+            let formatted = serde_json::to_string_pretty(&default_root).unwrap_or_default();
+            Self::write_file(&path, formatted)?;
+            println!("\x1b[32m✓ API Collection initialized:\x1b[0m {:?} (Authentication & Users)", path);
         }
 
+        let tables = self.get_all_tables().await;
+        let mut count = 0;
         for table in &tables {
             if Self::is_protected_table(table) && !force {
                 continue;
             }
-            let _ = self.generate_api_collection(table, force).await;
+            if self.generate_api_collection(table, force).await.is_ok() {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            println!("\x1b[32m✓ API Collection updated with {} custom table(s)!\x1b[0m", count);
         }
         Ok(())
     }
