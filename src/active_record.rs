@@ -397,6 +397,11 @@ impl Model {
 
     // ── presentation ──
 
+    /// Get hidden attributes slice.
+    pub const fn get_hidden(&self) -> &'static [&'static str] {
+        self.hidden
+    }
+
     /// Strip hidden attributes from one row.
     pub fn present(&self, mut row: Value) -> Value {
         if let Some(o) = row.as_object_mut() {
@@ -409,6 +414,25 @@ impl Model {
     pub fn hide_fields(&self, rows: Vec<Value>) -> Vec<Value> {
         if self.hidden.is_empty() { return rows; }
         rows.into_iter().map(|r| self.present(r)).collect()
+    }
+
+    /// Strip hidden attributes from a serde_json::Value, supporting both a single Object or an Array of Objects.
+    pub fn hide_fields_value(&self, mut val: Value) -> Value {
+        if self.hidden.is_empty() {
+            return val;
+        }
+        match val {
+            Value::Object(ref mut o) => {
+                for h in self.hidden {
+                    o.remove(*h);
+                }
+                val
+            }
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(|item| self.hide_fields_value(item)).collect())
+            }
+            other => other,
+        }
     }
 
     /// `filterFillable()` - empty `fillable` allows everything.

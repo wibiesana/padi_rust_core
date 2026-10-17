@@ -123,7 +123,6 @@ impl Generator {
     /// Introspect table foreign key relations based on DB foreign key constraints AND table structure.
     pub async fn get_table_relations(&self, table_name: &str) -> Vec<DetectedRelation> {
         let mut relations = Vec::new();
-        let all_tables = self.get_all_tables().await;
 
         // 1. Check database foreign key metadata from DB schema
         let fk_rows = if Database::is_sqlite() {
@@ -154,17 +153,9 @@ impl Generator {
                 let rel_name = from_col.strip_suffix("_id").unwrap_or(from_col).to_string();
                 let target_const = Self::screaming_snake_case(target_tbl);
                 
-                // Introspect target table to pick best display column (name > username > title)
+                // Introspect target table to pick best display column (username > name > title > id)
                 let target_cols = self.get_table_columns(target_tbl).await;
-                let display_col = if target_cols.iter().any(|c| c == "name") {
-                    "name"
-                } else if target_cols.iter().any(|c| c == "username") {
-                    "username"
-                } else if target_cols.iter().any(|c| c == "title") {
-                    "title"
-                } else {
-                    "id"
-                };
+                let display_col = Self::pick_display_column(target_tbl, &target_cols);
 
                 relations.push(DetectedRelation {
                     column: from_col.to_string(),
@@ -178,62 +169,24 @@ impl Generator {
             }
         }
 
-        // 2. Inferred relations from table columns and database structure
-        let cols = self.get_table_columns(table_name).await;
-        for col in cols {
-            if handled_cols.contains(&col) || matches!(col.as_str(), "id" | "created_at" | "updated_at" | "created_by" | "updated_by") {
-                continue;
-            }
+        relations
+    }
 
-            // Check if column is `xxx_id` OR matches another table name / singular table name (e.g. `user`, `author`, `category`)
-            let candidate_table = if let Some(stem) = col.strip_suffix("_id") {
-                let plural = Self::pluralize(stem);
-                if all_tables.iter().any(|t| t == &plural) {
-                    Some(plural)
-                } else if all_tables.iter().any(|t| t == stem) {
-                    Some(stem.to_string())
-                } else {
-                    None
-                }
-            } else {
-                // Column without _id, e.g. "user" or "author" or "category"
-                let plural = Self::pluralize(&col);
-                if all_tables.iter().any(|t| t == &plural) {
-                    Some(plural)
-                } else if all_tables.iter().any(|t| t == &col) {
-                    Some(col.clone())
-                } else {
-                    None
-                }
-            };
-
-            if let Some(target_tbl) = candidate_table {
-                let rel_name = col.strip_suffix("_id").unwrap_or(&col).to_string();
-                let target_const = Self::screaming_snake_case(&target_tbl);
-                let target_cols = self.get_table_columns(&target_tbl).await;
-                let display_col = if target_cols.iter().any(|c| c == "name") {
-                    "name"
-                } else if target_cols.iter().any(|c| c == "username") {
-                    "username"
-                } else if target_cols.iter().any(|c| c == "title") {
-                    "title"
-                } else {
-                    "id"
-                };
-
-                relations.push(DetectedRelation {
-                    column: col.clone(),
-                    relation_name: rel_name,
-                    target_table: target_tbl,
-                    target_const,
-                    target_pk: "id".to_string(),
-                    display_col: display_col.to_string(),
-                });
-                handled_cols.insert(col);
+    /// Pick appropriate display column for a table (e.g. username, name, title)
+    pub fn pick_display_column(target_tbl: &str, target_cols: &[String]) -> &'static str {
+        let is_user_table = target_tbl == "users" || target_tbl.ends_with("_users");
+        if is_user_table && target_cols.iter().any(|c| c == "username") {
+            return "username";
+        }
+        let candidates = [
+            "username", "name", "nama", "title", "judul", "email", "full_name", "code", "id",
+        ];
+        for cand in candidates {
+            if target_cols.iter().any(|c| c == cand) {
+                return cand;
             }
         }
-
-        relations
+        "id"
     }
 
     /// Normalize an input name (e.g. `Product`, `products`, `OrderItem`, `order_items`)
@@ -273,13 +226,14 @@ impl Generator {
         // Introspect fillable columns (exclude id, created_at, updated_at, created_by, updated_by)
         let cols = self.get_table_columns(&table_name).await;
         let fillable: Vec<String> = cols
-            .into_iter()
+            .iter()
             .filter(|c| {
                 !matches!(
                     c.as_str(),
                     "id" | "created_at" | "updated_at" | "created_by" | "updated_by"
                 )
             })
+            .cloned()
             .collect();
 
         // Introspect relations
@@ -306,6 +260,30 @@ impl Generator {
             );
         }
 
+        // Detect sensitive fields for .hidden(...)
+        let sensitive_fields: Vec<String> = cols
+            .iter()
+            .filter(|c| {
+                let lower = c.to_lowercase();
+                lower.contains("password")
+                    || lower.contains("token")
+                    || lower.contains("secret")
+                    || lower.contains("key")
+            })
+            .cloned()
+            .collect();
+
+        let hidden_chain = if !sensitive_fields.is_empty() {
+            let hidden_repr = sensitive_fields
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\n    .hidden(&[{}])", hidden_repr)
+        } else {
+            String::new()
+        };
+
         // 1. Tier 1: Base Model (ALWAYS regenerated/overwritten)
         let base_path = self
             .base_dir
@@ -319,7 +297,7 @@ impl Generator {
 /// Base model for table `{table_name}`.
 /// Auto-generated by Padi Framework. DO NOT EDIT DIRECTLY.
 /// This file is regenerated on every code generation.
-pub const BASE_{const_name}: Model = Model::new("{table_name}"){rel_chains};
+pub const BASE_{const_name}: Model = Model::new("{table_name}"){hidden_chain}{rel_chains};
 "#
             )
         } else {
@@ -335,7 +313,7 @@ pub const BASE_{const_name}: Model = Model::new("{table_name}"){rel_chains};
 /// Auto-generated by Padi Framework. DO NOT EDIT DIRECTLY.
 /// This file is regenerated on every code generation.
 pub const BASE_{const_name}: Model = Model::new("{table_name}")
-    .fillable(&[{fillable_repr}]){rel_chains};
+    .fillable(&[{fillable_repr}]){hidden_chain}{rel_chains};
 "#
             )
         };
@@ -413,20 +391,27 @@ impl Resource for {resource_struct} {{
 "#
             )
         } else {
-            let shape_entries = cols
-                .iter()
-                .map(|c| {
-                    if let Some(rel) = relations.iter().find(|r| &r.column == c) {
-                        format!(
-                            "            \"{}\": when_loaded(item, \"{}\").unwrap_or_else(|| json!({{ \"id\": item[\"{}\"] }})),",
-                            rel.relation_name, rel.relation_name, c
-                        )
-                    } else {
-                        format!("            \"{}\": item[\"{}\"],", c, c)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut entries = Vec::new();
+            let sensitive_patterns = ["password", "token", "secret", "key"];
+            for c in &cols {
+                let lower = c.to_lowercase();
+                if sensitive_patterns.iter().any(|p| lower.contains(p)) {
+                    continue;
+                }
+                entries.push(format!("            \"{}\": item[\"{}\"],", c, c));
+            }
+
+            if !relations.is_empty() {
+                entries.push("\n            // Relations".to_string());
+                for rel in &relations {
+                    entries.push(format!(
+                        "            \"{}\": when_loaded(item, \"{}\").unwrap_or_else(|| json!({{ \"id\": item[\"{}\"] }})),",
+                        rel.relation_name, rel.relation_name, rel.column
+                    ));
+                }
+            }
+
+            let shape_entries = entries.join("\n");
 
             format!(
                 r#"use padi_core::prelude::*;
