@@ -128,7 +128,7 @@ fn format_body(r: &ApiResponse) -> Value {
         }
         _ => {
             if let Value::Object(o) = &r.data {
-                if o.contains_key("success") || o.contains_key("message") {
+                if o.contains_key("success") {
                     map = o.clone();
                 } else {
                     map.insert("message".to_string(), json!(r.message));
