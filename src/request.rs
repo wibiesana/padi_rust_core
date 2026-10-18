@@ -78,11 +78,51 @@ impl Params {
         self.0.get(k).map(|s| s.as_str())
     }
 
-    /// `?page=` & `?per_page=` (per_page default 15, max 100).
+    /// `?page=` & `?per_page=` / `?per-page=` / `?limit=` (default 15, max 100).
     pub fn pagination(&self) -> (u64, u64) {
         let page = self.get("page").and_then(|v| v.parse().ok()).unwrap_or(1u64).max(1);
-        let per = self.get("per_page").and_then(|v| v.parse().ok()).unwrap_or(15u64).clamp(1, 100);
+        let per = self
+            .get("per_page")
+            .or_else(|| self.get("per-page"))
+            .or_else(|| self.get("limit"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15u64)
+            .clamp(1, 100);
         (page, per)
+    }
+
+    /// Extract sorting clause from query, e.g. `sort_by=col&order=desc`, `sort=-col`, or `order_by=col desc`.
+    pub fn order_by(&self) -> Option<String> {
+        if let Some(sort_col) = self
+            .get("sort_by")
+            .or_else(|| self.get("sort"))
+            .or_else(|| self.get("order_by"))
+            .or_else(|| self.get("orderBy"))
+        {
+            let sort_col = sort_col.trim();
+            if sort_col.is_empty() {
+                return None;
+            }
+            if let Some(stripped) = sort_col.strip_prefix('-') {
+                return Some(format!("{} DESC", stripped));
+            }
+            let dir = self
+                .get("order")
+                .or_else(|| self.get("direction"))
+                .unwrap_or("asc");
+            let dir_clean = if dir.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+            return Some(format!("{} {}", sort_col, dir_clean));
+        }
+        None
+    }
+
+    /// Extract search query term from `search`, `q`, or `keyword`.
+    pub fn search_term(&self) -> Option<&str> {
+        self.get("search")
+            .or_else(|| self.get("q"))
+            .or_else(|| self.get("keyword"))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
     }
 }
 

@@ -1,15 +1,22 @@
-//! Database - sqlx `Any` pool (MySQL / PostgreSQL / SQLite). Port of Database.php.
+//! Database - dedicated connection pools (MySQL / PostgreSQL / SQLite). Port of Database.php.
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     OnceLock,
 };
 
 use serde_json::{json, Map, Value};
-use sqlx::{any::AnyPoolOptions, AnyPool, Column, Row};
+use sqlx::{Column, Row};
 
 use crate::{env, error::ApiError};
 
-static POOL: OnceLock<AnyPool> = OnceLock::new();
+#[derive(Clone, Debug)]
+pub enum DbPool {
+    MySql(sqlx::MySqlPool),
+    Postgres(sqlx::PgPool),
+    Sqlite(sqlx::SqlitePool),
+}
+
+static POOL: OnceLock<DbPool> = OnceLock::new();
 static POSTGRES: OnceLock<bool> = OnceLock::new();
 static SQLITE: OnceLock<bool> = OnceLock::new();
 static QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -108,14 +115,30 @@ pub struct Database;
 impl Database {
     /// Connect using DATABASE_URL (or build one from DB_* variables).
     pub async fn connect() -> Result<(), ApiError> {
-        sqlx::any::install_default_drivers();
         let url = Self::url();
-        let _ = POSTGRES.set(url.starts_with("postgres"));
-        let _ = SQLITE.set(url.starts_with("sqlite"));
-        let pool = AnyPoolOptions::new()
-            .max_connections(env::get_int("DB_MAX_CONNECTIONS", 10) as u32)
-            .connect(&url)
-            .await?;
+        let max_conn = env::get_int("DB_MAX_CONNECTIONS", 10) as u32;
+
+        let pool = if url.starts_with("postgres") || url.starts_with("postgresql") {
+            let _ = POSTGRES.set(true);
+            let p = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(max_conn)
+                .connect(&url)
+                .await?;
+            DbPool::Postgres(p)
+        } else if url.starts_with("sqlite") {
+            let _ = SQLITE.set(true);
+            let p = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(max_conn)
+                .connect(&url)
+                .await?;
+            DbPool::Sqlite(p)
+        } else {
+            let p = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(max_conn)
+                .connect(&url)
+                .await?;
+            DbPool::MySql(p)
+        };
         let _ = POOL.set(pool);
         Ok(())
     }
@@ -128,18 +151,19 @@ impl Database {
         if driver == "sqlite" {
             return format!("sqlite://{}?mode=rwc", env::get_or("DB_DATABASE", "database/app.db"));
         }
+        let is_pg = driver == "pgsql" || driver == "postgres";
         format!(
             "{}://{}:{}@{}:{}/{}",
-            if driver == "pgsql" { "postgres" } else { "mysql" },
+            if is_pg { "postgres" } else { "mysql" },
             env::get_or("DB_USERNAME", "root"),
             env::get_or("DB_PASSWORD", ""),
             env::get_or("DB_HOST", "127.0.0.1"),
-            env::get_or("DB_PORT", if driver == "pgsql" { "5432" } else { "3306" }),
+            env::get_or("DB_PORT", if is_pg { "5432" } else { "3306" }),
             env::get_or("DB_DATABASE", "padi"),
         )
     }
 
-    pub fn pool() -> Result<&'static AnyPool, ApiError> {
+    pub fn pool() -> Result<&'static DbPool, ApiError> {
         POOL.get().ok_or_else(|| ApiError::internal("Database not connected"))
     }
 
@@ -202,30 +226,26 @@ impl Database {
         out
     }
 
-    fn bind_all<'q>(
-        sql: &'q str,
-        params: &'q [Val],
-    ) -> sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>> {
-        let mut q = sqlx::query(sql);
-        for p in params {
-            q = match p {
-                Val::Null => q.bind(Option::<String>::None),
-                Val::Bool(b) => q.bind(*b),
-                Val::Int(i) => q.bind(*i),
-                Val::Float(f) => q.bind(*f),
-                Val::Str(s) => q.bind(s.as_str()),
-            };
-        }
-        q
-    }
-
     pub async fn fetch_all(sql: &str, params: &[Val]) -> Result<Vec<Value>, ApiError> {
         let sql = Self::prepare(sql);
         let start = std::time::Instant::now();
-        let res = Self::bind_all(&sql, params).fetch_all(Self::pool()?).await;
+        let pool = Self::pool()?;
+        let res = match pool {
+            DbPool::MySql(p) => {
+                let rows = bind_mysql(&sql, params).fetch_all(p).await?;
+                rows.iter().map(mysql_row_to_json).collect()
+            }
+            DbPool::Postgres(p) => {
+                let rows = bind_postgres(&sql, params).fetch_all(p).await?;
+                rows.iter().map(pg_row_to_json).collect()
+            }
+            DbPool::Sqlite(p) => {
+                let rows = bind_sqlite(&sql, params).fetch_all(p).await?;
+                rows.iter().map(sqlite_row_to_json).collect()
+            }
+        };
         Self::record_query(&sql, params, start);
-        let rows = res?;
-        Ok(rows.iter().map(row_to_json).collect())
+        Ok(res)
     }
 
     pub async fn fetch_one(sql: &str, params: &[Val]) -> Result<Option<Value>, ApiError> {
@@ -236,14 +256,142 @@ impl Database {
     pub async fn execute(sql: &str, params: &[Val]) -> Result<(u64, Option<i64>), ApiError> {
         let sql = Self::prepare(sql);
         let start = std::time::Instant::now();
-        let res = Self::bind_all(&sql, params).execute(Self::pool()?).await;
+        let pool = Self::pool()?;
+        let r = match pool {
+            DbPool::MySql(p) => {
+                let res = bind_mysql(&sql, params).execute(p).await?;
+                (res.rows_affected(), Some(res.last_insert_id() as i64))
+            }
+            DbPool::Postgres(p) => {
+                let res = bind_postgres(&sql, params).execute(p).await?;
+                (res.rows_affected(), None)
+            }
+            DbPool::Sqlite(p) => {
+                let res = bind_sqlite(&sql, params).execute(p).await?;
+                (res.rows_affected(), Some(res.last_insert_rowid()))
+            }
+        };
         Self::record_query(&sql, params, start);
-        let r = res?;
-        Ok((r.rows_affected(), r.last_insert_id()))
+        Ok(r)
     }
 }
 
-fn row_to_json(row: &sqlx::any::AnyRow) -> Value {
+fn bind_mysql<'q>(
+    sql: &'q str,
+    params: &'q [Val],
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    let mut q = sqlx::query(sql);
+    for p in params {
+        q = match p {
+            Val::Null => q.bind(Option::<String>::None),
+            Val::Bool(b) => q.bind(*b),
+            Val::Int(i) => q.bind(*i),
+            Val::Float(f) => q.bind(*f),
+            Val::Str(s) => q.bind(s.as_str()),
+        };
+    }
+    q
+}
+
+fn bind_postgres<'q>(
+    sql: &'q str,
+    params: &'q [Val],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let mut q = sqlx::query(sql);
+    for p in params {
+        q = match p {
+            Val::Null => q.bind(Option::<String>::None),
+            Val::Bool(b) => q.bind(*b),
+            Val::Int(i) => q.bind(*i),
+            Val::Float(f) => q.bind(*f),
+            Val::Str(s) => q.bind(s.as_str()),
+        };
+    }
+    q
+}
+
+fn bind_sqlite<'q>(
+    sql: &'q str,
+    params: &'q [Val],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    let mut q = sqlx::query(sql);
+    for p in params {
+        q = match p {
+            Val::Null => q.bind(Option::<String>::None),
+            Val::Bool(b) => q.bind(*b),
+            Val::Int(i) => q.bind(*i),
+            Val::Float(f) => q.bind(*f),
+            Val::Str(s) => q.bind(s.as_str()),
+        };
+    }
+    q
+}
+
+fn mysql_row_to_json(row: &sqlx::mysql::MySqlRow) -> Value {
+    let mut map = Map::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let v = if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<u64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<rust_decimal::Decimal>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(i) {
+            v.map(|x| json!(x.format("%Y-%m-%d %H:%M:%S").to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+            v.map(|x| json!(x.to_rfc3339()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveTime>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+            v.map(|x| String::from_utf8(x).map(|s| json!(s)).unwrap_or(Value::Null))
+        } else {
+            None
+        };
+        map.insert(col.name().to_string(), v.unwrap_or(Value::Null));
+    }
+    Value::Object(map)
+}
+
+fn pg_row_to_json(row: &sqlx::postgres::PgRow) -> Value {
+    let mut map = Map::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let v = if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<rust_decimal::Decimal>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+            v.map(|x| json!(x.to_rfc3339()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(i) {
+            v.map(|x| json!(x.format("%Y-%m-%d %H:%M:%S").to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveTime>, _>(i) {
+            v.map(|x| json!(x.to_string()))
+        } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+            v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+            v.map(|x| String::from_utf8(x).map(|s| json!(s)).unwrap_or(Value::Null))
+        } else {
+            None
+        };
+        map.insert(col.name().to_string(), v.unwrap_or(Value::Null));
+    }
+    Value::Object(map)
+}
+
+fn sqlite_row_to_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     let mut map = Map::new();
     for (i, col) in row.columns().iter().enumerate() {
         let v = if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
@@ -254,6 +402,8 @@ fn row_to_json(row: &sqlx::any::AnyRow) -> Value {
             v.map(|x| json!(x))
         } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
             v.map(|x| json!(x))
+        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+            v.map(|x| String::from_utf8(x).map(|s| json!(s)).unwrap_or(Value::Null))
         } else {
             None
         };

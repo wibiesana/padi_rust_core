@@ -65,6 +65,11 @@ impl Auth {
         keys().map(|_| ())
     }
 
+    /// Generate a cryptographically secure 64-character remember token.
+    pub fn generate_remember_token() -> String {
+        format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+    }
+
     /// Generate a JWT. `payload` must be a JSON object. `expiry` in seconds.
     pub fn generate_token(mut payload: Value, expiry: i64) -> Result<String, ApiError> {
         let k = keys()?;

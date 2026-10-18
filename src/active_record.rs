@@ -125,7 +125,7 @@ pub fn current_user_id() -> Option<i64> {
 
 // ───────────────────────── columns cache ─────────────────────────
 
-type ColumnsCache = RwLock<HashMap<String, (Vec<String>, u64)>>;
+type ColumnsCache = RwLock<HashMap<String, (Vec<String>, HashMap<String, String>, u64)>>;
 
 fn columns_cache() -> &'static ColumnsCache {
     static C: OnceLock<ColumnsCache> = OnceLock::new();
@@ -341,10 +341,19 @@ impl Model {
     /// Fluent model-aware builder (`static::find()`).
     pub fn find_query(&self) -> ModelQuery { ModelQuery::new(self.clone()) }
 
-    fn now_value(&self) -> Value {
-        match self.timestamp_format {
-            TimestampFormat::Unix => json!(chrono::Utc::now().timestamp()),
-            TimestampFormat::Datetime => Value::String(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+    pub async fn now_value(&self) -> Value {
+        if self.timestamp_format == TimestampFormat::Unix {
+            json!(chrono::Utc::now().timestamp())
+        } else {
+            let col_types = self.get_table_column_types().await;
+            let [ca, ua, _, _] = self.audit_fields;
+            let is_int_ts = col_types.get(ca).is_some_and(|t| t.contains("int"))
+                || col_types.get(ua).is_some_and(|t| t.contains("int"));
+            if is_int_ts {
+                json!(chrono::Utc::now().timestamp())
+            } else {
+                Value::String(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string())
+            }
         }
     }
 
@@ -357,42 +366,62 @@ impl Model {
 
     /// Table columns, cached with TTL (`COLUMNS_CACHE_TTL`, default 3600s, 0 = forever).
     pub async fn get_table_columns(&self) -> Vec<String> {
-        let ttl = env::get_int("COLUMNS_CACHE_TTL", 3600).max(0) as u64;
-        let now = crate::now_secs();
-        if let Ok(c) = columns_cache().read() {
-            if let Some((cols, at)) = c.get(self.table) {
-                if ttl == 0 || now.saturating_sub(*at) < ttl {
-                    return cols.clone();
-                }
-            }
-        }
-        let cols = self.fetch_columns().await.unwrap_or_default();
-        if !cols.is_empty() {
-            if let Ok(mut c) = columns_cache().write() {
-                c.insert(self.table.to_string(), (cols.clone(), now));
-            }
-        }
+        let (cols, _) = self.get_table_schema_info().await;
         cols
     }
 
-    async fn fetch_columns(&self) -> Result<Vec<String>, ApiError> {
+    /// Column data types mapped by lowercase column name.
+    pub async fn get_table_column_types(&self) -> HashMap<String, String> {
+        let (_, types) = self.get_table_schema_info().await;
+        types
+    }
+
+    async fn get_table_schema_info(&self) -> (Vec<String>, HashMap<String, String>) {
+        let ttl = env::get_int("COLUMNS_CACHE_TTL", 3600).max(0) as u64;
+        let now = crate::now_secs();
+        if let Ok(c) = columns_cache().read() {
+            if let Some((cols, types, at)) = c.get(self.table) {
+                if ttl == 0 || now.saturating_sub(*at) < ttl {
+                    return (cols.clone(), types.clone());
+                }
+            }
+        }
+        let (cols, types) = self.fetch_column_info().await.unwrap_or_default();
+        if !cols.is_empty() {
+            if let Ok(mut c) = columns_cache().write() {
+                c.insert(self.table.to_string(), (cols.clone(), types.clone(), now));
+            }
+        }
+        (cols, types)
+    }
+
+    async fn fetch_column_info(&self) -> Result<(Vec<String>, HashMap<String, String>), ApiError> {
         check_ident(self.table, "table name")?;
         let rows = if Database::is_sqlite() {
             Database::fetch_all(&format!("PRAGMA table_info({})", self.table), &[]).await?
         } else if Database::is_postgres() {
             Database::fetch_all(
-                "SELECT column_name AS name FROM information_schema.columns WHERE table_name = ?",
+                "SELECT column_name AS name, data_type AS type FROM information_schema.columns WHERE table_name = ?",
                 &[Val::from(self.table)],
             )
             .await?
         } else {
             Database::fetch_all(
-                "SELECT CAST(column_name AS CHAR) AS name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+                "SELECT CAST(column_name AS CHAR) AS name, CAST(data_type AS CHAR) AS type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
                 &[Val::from(self.table)],
             )
             .await?
         };
-        Ok(rows.iter().filter_map(|r| r["name"].as_str().map(String::from)).collect())
+        let mut names = Vec::new();
+        let mut types = HashMap::new();
+        for r in rows {
+            if let Some(name) = r["name"].as_str() {
+                names.push(name.to_string());
+                let dt = r.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                types.insert(name.to_lowercase(), dt);
+            }
+        }
+        Ok((names, types))
     }
 
     // ── presentation ──
@@ -484,17 +513,36 @@ impl Model {
         q
     }
 
-    /// Resolve ORDER BY: explicit > `default_order` > `pk DESC` (single pk only).
-    fn order_pairs(&self, order_by: Option<&str>) -> Result<Vec<(String, String)>, ApiError> {
-        match order_by.or(self.default_order) {
-            Some(o) => sanitize_order_by(o),
-            None if !self.is_composite() => Ok(vec![(self.pk.to_string(), "DESC".into())]),
-            None => Ok(vec![]),
+    /// Resolve ORDER BY: explicit > `default_order` > `pk DESC` (single pk only if column exists).
+    async fn order_pairs(&self, order_by: Option<&str>) -> Result<Vec<(String, String)>, ApiError> {
+        let cols = self.get_table_columns().await;
+        if let Some(o) = order_by.or(self.default_order) {
+            let pairs = sanitize_order_by(o)?;
+            if cols.is_empty() {
+                return Ok(pairs);
+            }
+            let valid_pairs: Vec<(String, String)> = pairs
+                .into_iter()
+                .filter(|(c, _)| cols.iter().any(|col| col.eq_ignore_ascii_case(c)))
+                .collect();
+            if !valid_pairs.is_empty() {
+                return Ok(valid_pairs);
+            }
         }
+
+        // If no explicit order given or given column wasn't in the table:
+        if !self.is_composite() {
+            if cols.is_empty() || cols.iter().any(|c| c == self.pk) {
+                return Ok(vec![(self.pk.to_string(), "DESC".into())]);
+            } else if let Some(first_col) = cols.first() {
+                return Ok(vec![(first_col.clone(), "ASC".into())]);
+            }
+        }
+        Ok(vec![])
     }
 
-    fn with_order(&self, mut q: Query, order_by: Option<&str>) -> Result<Query, ApiError> {
-        for (c, d) in self.order_pairs(order_by)? { q = q.order_by(&c, &d); }
+    async fn with_order(&self, mut q: Query, order_by: Option<&str>) -> Result<Query, ApiError> {
+        for (c, d) in self.order_pairs(order_by).await? { q = q.order_by(&c, &d); }
         Ok(q)
     }
 
@@ -509,7 +557,7 @@ impl Model {
         let has_ts = |c: &str| cols.is_empty() || cols.iter().any(|x| x == c);
         let has = |c: &str| cols.iter().any(|x| x == c);
         let unset = |d: &Map<String, Value>, c: &str| d.get(c).is_none_or(Value::is_null);
-        let now = self.now_value();
+        let now = self.now_value().await;
         let user = current_user_id();
 
         if insert {
@@ -542,7 +590,7 @@ impl Model {
     /// `all($columns, $orderBy)`
     pub async fn all_with(&self, columns: &[&str], order_by: Option<&str>) -> Result<Vec<Value>, ApiError> {
         check_cols(columns)?;
-        let mut q = self.with_order(self.query(), order_by)?;
+        let mut q = self.with_order(self.query(), order_by).await?;
         if !columns.is_empty() { q = q.select(columns); }
         let rows = q.get().await?;
         self.process_rows(rows, &self.get_with()).await
@@ -612,7 +660,7 @@ impl Model {
     /// ordered like `all()`.
     pub async fn filter_where(&self, conditions: &Value, columns: &[&str]) -> Result<Vec<Value>, ApiError> {
         check_cols(columns)?;
-        let mut q = self.with_order(apply_conditions(self.query(), &filter_conditions(conditions))?, None)?;
+        let mut q = self.with_order(apply_conditions(self.query(), &filter_conditions(conditions))?, None).await?;
         if !columns.is_empty() { q = q.select(columns); }
         let rows = q.get().await?;
         self.process_rows(rows, &self.get_with()).await
@@ -645,7 +693,7 @@ impl Model {
             }
         };
 
-        let rows = self.with_order(q, order_by)?.limit(per_page).offset(offset).get().await?;
+        let rows = self.with_order(q, order_by).await?.limit(per_page).offset(offset).get().await?;
         let data = self.process_rows(rows, &self.get_with()).await?;
         let t = total.max(0) as u64;
         Ok(json!({
@@ -656,6 +704,61 @@ impl Model {
                 "current_page": page,
                 "last_page": t.div_ceil(per_page),
                 "from": offset + 1,
+                "to": (offset + per_page).min(t),
+            }
+        }))
+    }
+
+    /// Paginate using request `Params`: handles `page`, `per_page`/`per-page`/`limit`, `sort_by`/`order`, and `search`.
+    pub async fn paginate_params(&self, p: &crate::request::Params) -> Result<Value, ApiError> {
+        let (page, per_page) = p.pagination();
+        let order_by = p.order_by();
+        let search = p.search_term();
+
+        let mut q = self.query();
+
+        if let Some(term) = search {
+            let term = term.trim();
+            if !term.is_empty() {
+                let like = if Database::is_postgres() { "ILIKE" } else { "LIKE" };
+                let t = self.table;
+                let pattern = format!("%{}%", term);
+                let mut parts: Vec<String> = Vec::new();
+                let mut params: Vec<Val> = Vec::new();
+
+                for f in self.fillable {
+                    parts.push(format!("{}.{} {} ?", t, f, like));
+                    params.push(Val::Str(pattern.clone()));
+                }
+
+                if !parts.is_empty() {
+                    q = q.where_raw(&parts.join(" OR "), params);
+                }
+            }
+        }
+
+        let total = q.count().await? as u64;
+        let offset = (page - 1) * per_page;
+
+        let rows = self
+            .with_order(q, order_by.as_deref())
+            .await?
+            .limit(per_page)
+            .offset(offset)
+            .get()
+            .await?;
+
+        let data = self.process_rows(rows, &self.get_with()).await?;
+        let t = total;
+
+        Ok(json!({
+            "data": data,
+            "meta": {
+                "total": total,
+                "per_page": per_page,
+                "current_page": page,
+                "last_page": t.div_ceil(per_page).max(1),
+                "from": if total > 0 { offset + 1 } else { 0 },
                 "to": (offset + per_page).min(t),
             }
         }))
@@ -843,14 +946,35 @@ impl Model {
         Ok(Some((attrs, id)))
     }
 
-    /// `create()`: insert and return the stored row.
+    /// `create()`: insert and return the stored row with relations.
     pub async fn create(&self, data: &Value) -> Result<Value, ApiError> {
         let Some((attrs, id)) = self.insert_inner(data).await? else {
             return Err(ApiError::bad_request("Save aborted by beforeSave hook"));
         };
-        match id {
-            Some(id) if id > 0 => self.find_or_fail(id).await,
-            _ => Ok(self.present(Value::Object(attrs))),
+        let pk: Option<Pk> = if self.is_composite() {
+            let mut pk_map = Map::new();
+            for col in self.composite_pk {
+                if let Some(v) = attrs.get(*col) {
+                    pk_map.insert((*col).to_string(), v.clone());
+                }
+            }
+            if !pk_map.is_empty() {
+                Some(Pk(Value::Object(pk_map)))
+            } else {
+                None
+            }
+        } else if let Some(id) = id.filter(|&id| id > 0) {
+            Some(Pk(json!(id)))
+        } else if let Some(v) = attrs.get(self.pk) {
+            Some(Pk(v.clone()))
+        } else {
+            None
+        };
+
+        if let Some(pk) = pk {
+            self.find_or_fail(pk).await
+        } else {
+            Ok(self.present(Value::Object(attrs)))
         }
     }
 

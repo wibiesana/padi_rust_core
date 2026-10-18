@@ -71,6 +71,16 @@ impl Console {
                 }
             }
 
+            "make:route" | "create:route" => {
+                let name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
+                if let Some(name) = name {
+                    generator.generate_route(name, force)?;
+                } else {
+                    eprintln!("\x1b[31mError: Route name is required.\x1b[0m");
+                    println!("Usage: padi make:route <name>");
+                }
+            }
+
             "generate:crud" | "g" => {
                 let table_name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
                 if let Some(table) = table_name {
@@ -200,6 +210,7 @@ impl Console {
         println!("  \x1b[32mmake:controller\x1b[0m <name>      Create a new controller");
         println!("  \x1b[32mmake:model\x1b[0m <table_name>   Create a new model from database table");
         println!("  \x1b[32mmake:resource\x1b[0m <name>        Create a new API resource");
+        println!("  \x1b[32mmake:route\x1b[0m <name>           Create and mount a new API route");
         println!("  \x1b[32mmake:migration\x1b[0m <name>       Create a new SQL migration file");
         println!("  \x1b[32mmake:collection\x1b[0m [table]      Generate API Collection (api_collection/<table_name>_collection.json)");
 

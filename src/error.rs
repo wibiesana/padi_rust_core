@@ -29,6 +29,11 @@ impl ApiError {
     pub fn forbidden(m: impl Into<String>) -> Self { Self::http(403, m) }
     pub fn not_found(m: impl Into<String>) -> Self { Self::http(404, m) }
     pub fn internal(m: impl Into<String>) -> Self { Self::http(500, m) }
+    pub fn validation(field: impl Into<String>, message: impl Into<String>) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(field.into(), vec![message.into()]);
+        Self::Validation(map)
+    }
 
     pub fn status(&self) -> u16 {
         match self {

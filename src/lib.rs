@@ -35,6 +35,7 @@ pub mod validator;
 
 pub use axum;
 pub use serde_json;
+pub use uuid;
 pub use request::Request;
 
 /// Current unix timestamp in seconds.
@@ -78,6 +79,7 @@ pub mod prelude {
     pub use crate::validator::Validator;
     pub use axum::{
         extract::Path,
+        http::HeaderMap,
         routing::{delete, get, patch, post, put},
         Router,
     };
