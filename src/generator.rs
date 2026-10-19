@@ -836,6 +836,7 @@ DROP TABLE IF EXISTS {table};
             return Ok(());
         }
 
+        let route_prefix = table_name.replace('_', "-");
         let id_var_key = format!("{}_id", singular);
 
         // Get table columns to create realistic dummy sample JSON body
@@ -895,7 +896,7 @@ DROP TABLE IF EXISTS {table};
                 "request": {
                     "method": "GET",
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}", plural)
+                        "raw": format!("{{{{base_url}}}}/{}?page=1&per-page=25&search=&sort_by=id&order=desc", route_prefix)
                     }
                 }
             },
@@ -904,7 +905,7 @@ DROP TABLE IF EXISTS {table};
                 "request": {
                     "method": "GET",
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}/all", plural)
+                        "raw": format!("{{{{base_url}}}}/{}/all?search=&sort_by=id&order=desc", route_prefix)
                     }
                 }
             },
@@ -913,7 +914,7 @@ DROP TABLE IF EXISTS {table};
                 "request": {
                     "method": "GET",
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", route_prefix, singular)
                     }
                 }
             },
@@ -941,7 +942,7 @@ DROP TABLE IF EXISTS {table};
                         "raw": create_body_raw
                     },
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}", plural)
+                        "raw": format!("{{{{base_url}}}}/{}", route_prefix)
                     }
                 }
             },
@@ -960,7 +961,7 @@ DROP TABLE IF EXISTS {table};
                         "raw": update_body_raw
                     },
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", route_prefix, singular)
                     }
                 }
             },
@@ -969,7 +970,7 @@ DROP TABLE IF EXISTS {table};
                 "request": {
                     "method": "DELETE",
                     "url": {
-                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", plural, singular)
+                        "raw": format!("{{{{base_url}}}}/{}/{{{{{}_id}}}}", route_prefix, singular)
                     }
                 }
             }
