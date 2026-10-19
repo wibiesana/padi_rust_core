@@ -115,6 +115,21 @@ fn format_body(r: &ApiResponse) -> Value {
             if let Value::Object(o) = &r.data {
                 if o.contains_key("status") {
                     map = o.clone();
+                    if let Some(item_obj) = map.get("item").and_then(|v| v.as_object()) {
+                        if item_obj.contains_key("data") && item_obj.contains_key("meta") {
+                            let items = item_obj["data"].clone();
+                            let meta = item_obj["meta"].clone();
+                            map.insert("item".to_string(), items);
+                            if !map.contains_key("meta") {
+                                map.insert("meta".to_string(), meta);
+                            }
+                        }
+                    }
+                } else if o.contains_key("meta") && o.contains_key("data") {
+                    map.insert("status".to_string(), json!("success"));
+                    map.insert("code".to_string(), json!(status_code_name(r.status)));
+                    map.insert("item".to_string(), o["data"].clone());
+                    map.insert("meta".to_string(), o["meta"].clone());
                 } else {
                     map.insert("status".to_string(), json!("success"));
                     map.insert("code".to_string(), json!(status_code_name(r.status)));
@@ -130,6 +145,22 @@ fn format_body(r: &ApiResponse) -> Value {
             if let Value::Object(o) = &r.data {
                 if o.contains_key("success") {
                     map = o.clone();
+                    if let Some(item_obj) = map.get("item").and_then(|v| v.as_object()) {
+                        if item_obj.contains_key("data") && item_obj.contains_key("meta") {
+                            let items = item_obj["data"].clone();
+                            let meta = item_obj["meta"].clone();
+                            map.insert("item".to_string(), items);
+                            if !map.contains_key("meta") {
+                                map.insert("meta".to_string(), meta);
+                            }
+                        }
+                    }
+                } else if o.contains_key("meta") && o.contains_key("data") {
+                    map.insert("message".to_string(), json!(r.message));
+                    map.insert("message_code".to_string(), json!(status_code_name(r.status)));
+                    map.insert("success".to_string(), json!(true));
+                    map.insert("item".to_string(), o["data"].clone());
+                    map.insert("meta".to_string(), o["meta"].clone());
                 } else {
                     map.insert("message".to_string(), json!(r.message));
                     map.insert("message_code".to_string(), json!(status_code_name(r.status)));
@@ -388,6 +419,27 @@ mod tests {
         let val = format_body(&resp);
         assert_eq!(val["success"], true);
         assert_eq!(val["item"]["id"], 1);
+    }
+
+    #[test]
+    fn test_api_response_paginated() {
+        let paged_data = json!({
+            "data": [{"id": 1, "name": "Work 1"}, {"id": 2, "name": "Work 2"}],
+            "meta": {
+                "total": 2,
+                "per_page": 10,
+                "current_page": 1,
+                "last_page": 1
+            }
+        });
+        let resp = ok(paged_data).unwrap();
+        let val = format_body(&resp);
+        assert_eq!(val["success"], true);
+        assert!(val["item"].is_array());
+        assert_eq!(val["item"].as_array().unwrap().len(), 2);
+        assert_eq!(val["item"][0]["name"], "Work 1");
+        assert!(val.get("meta").is_some());
+        assert_eq!(val["meta"]["total"], 2);
     }
 
     #[test]
