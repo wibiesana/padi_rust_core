@@ -39,6 +39,29 @@ pub struct DetectedRelation {
     pub display_col: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TableColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub has_default: bool,
+    pub is_primary_key: bool,
+    pub is_auto_increment: bool,
+}
+
+fn json_get_str<'a>(r: &'a Value, key: &str) -> Option<&'a str> {
+    r.get(key)
+        .or_else(|| r.get(&key.to_uppercase()))
+        .or_else(|| r.get(&key.to_lowercase()))
+        .and_then(|v| v.as_str())
+}
+
+fn json_get_val<'a>(r: &'a Value, key: &str) -> Option<&'a Value> {
+    r.get(key)
+        .or_else(|| r.get(&key.to_uppercase()))
+        .or_else(|| r.get(&key.to_lowercase()))
+}
+
 pub struct Generator {
     pub base_dir: PathBuf,
 }
@@ -65,30 +88,97 @@ impl Generator {
         Ok(())
     }
 
-    /// Introspect table columns from database (SQLite / MySQL / Postgres).
-    pub async fn get_table_columns(&self, table_name: &str) -> Vec<String> {
-        let (sql, key, params) = if Database::is_sqlite() {
-            (format!("PRAGMA table_info({})", table_name), "name", vec![])
+    /// Introspect table columns with rich schema metadata (data type, nullable, default value, primary key, auto increment).
+    pub async fn get_table_columns_info(&self, table_name: &str) -> Vec<TableColumnInfo> {
+        let pks = self.get_table_primary_keys(table_name).await;
+
+        if Database::is_sqlite() {
+            let sql = format!("PRAGMA table_info({})", table_name);
+            let rows = Database::fetch_all(&sql, &[]).await.unwrap_or_default();
+            rows.into_iter()
+                .filter_map(|r| {
+                    let name = json_get_str(&r, "name")?.to_string();
+                    let data_type = json_get_str(&r, "type").unwrap_or("").to_lowercase();
+                    let notnull = r.get("notnull").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let is_nullable = notnull == 0;
+                    let has_default = r.get("dflt_value").map(|v| !v.is_null()).unwrap_or(false);
+                    let pk = r.get("pk").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let is_primary_key = pk > 0 || pks.contains(&name);
+                    let is_auto_increment = is_primary_key && data_type.contains("int");
+                    Some(TableColumnInfo {
+                        name,
+                        data_type,
+                        is_nullable,
+                        has_default,
+                        is_primary_key,
+                        is_auto_increment,
+                    })
+                })
+                .collect()
         } else if Database::is_postgres() {
-            (
-                "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position".to_string(),
-                "column_name",
-                vec![Val::from(table_name)],
-            )
+            let sql = "SELECT column_name, data_type, is_nullable, column_default \
+                       FROM information_schema.columns \
+                       WHERE table_name = ? \
+                       ORDER BY ordinal_position";
+            let rows = Database::fetch_all(sql, &[Val::from(table_name)]).await.unwrap_or_default();
+            rows.into_iter()
+                .filter_map(|r| {
+                    let name = json_get_str(&r, "column_name")?.to_string();
+                    let data_type = json_get_str(&r, "data_type").unwrap_or("").to_lowercase();
+                    let is_null_str = json_get_str(&r, "is_nullable").unwrap_or("").to_uppercase();
+                    let is_nullable = is_null_str == "YES";
+                    let col_def = json_get_val(&r, "column_default");
+                    let has_default = col_def.is_some_and(|v| !v.is_null());
+                    let def_str = col_def.and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let is_auto_increment = def_str.contains("nextval");
+                    let is_primary_key = pks.contains(&name) || is_auto_increment;
+                    Some(TableColumnInfo {
+                        name,
+                        data_type,
+                        is_nullable,
+                        has_default,
+                        is_primary_key,
+                        is_auto_increment,
+                    })
+                })
+                .collect()
         } else {
             // MySQL / MariaDB
-            (
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position".to_string(),
-                "column_name",
-                vec![Val::from(table_name)],
-            )
-        };
+            let sql = "SELECT column_name, data_type, is_nullable, column_default, extra \
+                       FROM information_schema.columns \
+                       WHERE table_schema = DATABASE() AND table_name = ? \
+                       ORDER BY ordinal_position";
+            let rows = Database::fetch_all(sql, &[Val::from(table_name)]).await.unwrap_or_default();
+            rows.into_iter()
+                .filter_map(|r| {
+                    let name = json_get_str(&r, "column_name")?.to_string();
+                    let data_type = json_get_str(&r, "data_type").unwrap_or("").to_lowercase();
+                    let is_null_str = json_get_str(&r, "is_nullable").unwrap_or("").to_uppercase();
+                    let is_nullable = is_null_str == "YES";
+                    let col_def = json_get_val(&r, "column_default");
+                    let has_default = col_def.is_some_and(|v| !v.is_null());
+                    let extra = json_get_str(&r, "extra").unwrap_or("").to_lowercase();
+                    let is_auto_increment = extra.contains("auto_increment");
+                    let is_primary_key = pks.contains(&name);
+                    Some(TableColumnInfo {
+                        name,
+                        data_type,
+                        is_nullable,
+                        has_default,
+                        is_primary_key,
+                        is_auto_increment,
+                    })
+                })
+                .collect()
+        }
+    }
 
-        Database::fetch_all(&sql, &params)
+    /// Introspect table columns from database (SQLite / MySQL / Postgres).
+    pub async fn get_table_columns(&self, table_name: &str) -> Vec<String> {
+        self.get_table_columns_info(table_name)
             .await
-            .unwrap_or_default()
             .into_iter()
-            .filter_map(|r| r[key].as_str().map(String::from))
+            .map(|c| c.name)
             .collect()
     }
 
@@ -221,10 +311,14 @@ impl Generator {
             let to_col = r.get("to").and_then(|v| v.as_str()).unwrap_or("id");
 
             if !from_col.is_empty() && !target_tbl.is_empty() {
-                let rel_name = from_col.strip_suffix("_id").unwrap_or(from_col).to_string();
+                let rel_name = if from_col == "id" {
+                    Self::singularize(target_tbl)
+                } else {
+                    from_col.strip_suffix("_id").unwrap_or(from_col).to_string()
+                };
                 let target_const = Self::screaming_snake_case(target_tbl);
                 
-                // Introspect target table to pick best display column (username > name > title > id)
+                // Introspect target table to pick best display column (username > name > pen_name > title > id)
                 let target_cols = self.get_table_columns(target_tbl).await;
                 let display_col = Self::pick_display_column(target_tbl, &target_cols);
 
@@ -234,7 +328,7 @@ impl Generator {
                     target_table: target_tbl.to_string(),
                     target_const,
                     target_pk: to_col.to_string(),
-                    display_col: display_col.to_string(),
+                    display_col,
                 });
                 handled_cols.insert(from_col.to_string());
             }
@@ -243,21 +337,83 @@ impl Generator {
         relations
     }
 
-    /// Pick appropriate display column for a table (e.g. username, name, title)
-    pub fn pick_display_column(target_tbl: &str, target_cols: &[String]) -> &'static str {
+    /// Pick appropriate display column for a table (e.g. username, name, pen_name, title)
+    pub fn pick_display_column(target_tbl: &str, target_cols: &[String]) -> String {
         let is_user_table = target_tbl == "users" || target_tbl.ends_with("_users");
-        if is_user_table && target_cols.iter().any(|c| c == "username") {
-            return "username";
+        if is_user_table && target_cols.iter().any(|c| c.eq_ignore_ascii_case("username")) {
+            return "username".to_string();
         }
+
+        // 1. High-priority name / title candidates in order of preference
         let candidates = [
-            "username", "name", "nama", "title", "judul", "email", "full_name", "code", "id",
+            "name",
+            "nama",
+            "pen_name",
+            "username",
+            "title",
+            "judul",
+            "display_name",
+            "full_name",
+            "first_name",
+            "nickname",
+            "label",
+            "caption",
+            "content",
+            "body",
+            "message",
+            "code",
+            "slug",
+            "email",
+            "description",
         ];
         for cand in candidates {
-            if target_cols.iter().any(|c| c == cand) {
-                return cand;
+            if let Some(col) = target_cols.iter().find(|c| c.eq_ignore_ascii_case(cand)) {
+                return col.clone();
             }
         }
-        "id"
+
+        // 2. Columns ending with _name, _title, _label (e.g. pen_name, author_name, item_title)
+        if let Some(col) = target_cols.iter().find(|c| {
+            let l = c.to_ascii_lowercase();
+            (l.ends_with("_name") || l.ends_with("_title") || l.ends_with("_label"))
+                && !l.contains("file") && !l.contains("image") && !l.contains("icon")
+        }) {
+            return col.clone();
+        }
+
+        // 3. Columns containing name, title, or label (not ids, paths, images, files)
+        if let Some(col) = target_cols.iter().find(|c| {
+            let l = c.to_ascii_lowercase();
+            (l.contains("name") || l.contains("title") || l.contains("label"))
+                && !l.ends_with("_id")
+                && !l.contains("url")
+                && !l.contains("path")
+                && !l.contains("image")
+                && !l.contains("icon")
+                && !l.contains("file")
+        }) {
+            return col.clone();
+        }
+
+        // 4. First meaningful string column (not system, sensitive, or an id)
+        if let Some(col) = target_cols.iter().find(|c| {
+            let l = c.to_ascii_lowercase();
+            !matches!(
+                l.as_str(),
+                "id" | "created_at" | "updated_at" | "created_by" | "updated_by" | "deleted_at"
+            ) && !l.ends_with("_id")
+                && !l.contains("password")
+                && !l.contains("token")
+                && !l.contains("secret")
+                && !l.contains("key")
+                && !l.contains("hash")
+                && !l.contains("url")
+                && !l.contains("image")
+        }) {
+            return col.clone();
+        }
+
+        "id".to_string()
     }
 
     /// Normalize an input name (e.g. `Product`, `products`, `OrderItem`, `order_items`)
@@ -314,10 +470,17 @@ impl Generator {
             let rel_lines: Vec<String> = relations
                 .iter()
                 .map(|r| {
-                    format!(
-                        "        Relation::belongs_to(\"{}\", || crate::models::{}, \"{}\", \"{}\")\n            .columns(&[\"id\", \"{}\"]),",
-                        r.relation_name, r.target_const, r.column, r.target_pk, r.display_col
-                    )
+                    if r.display_col == r.target_pk {
+                        format!(
+                            "        Relation::belongs_to(\"{}\", || crate::models::{}, \"{}\", \"{}\")\n            .columns(&[\"{}\"]),",
+                            r.relation_name, r.target_const, r.column, r.target_pk, r.target_pk
+                        )
+                    } else {
+                        format!(
+                            "        Relation::belongs_to(\"{}\", || crate::models::{}, \"{}\", \"{}\")\n            .columns(&[\"{}\", \"{}\"]),",
+                            r.relation_name, r.target_const, r.column, r.target_pk, r.target_pk, r.display_col
+                        )
+                    }
                 })
                 .collect();
             let with_items: Vec<String> = relations
@@ -541,33 +704,78 @@ impl Resource for {resource_struct} {{
         }
 
         // Introspect table columns to build validation rules
-        let cols = self.get_table_columns(&table_name).await;
+        let col_infos = self.get_table_columns_info(&table_name).await;
         let mut store_rules = Vec::new();
         let mut update_rules = Vec::new();
 
-        for col in &cols {
+        for col_info in &col_infos {
+            let col = &col_info.name;
             let c_lower = col.to_ascii_lowercase();
-            if matches!(c_lower.as_str(), "id" | "created_at" | "updated_at" | "created_by" | "updated_by") {
+            if col_info.is_primary_key
+                || col_info.is_auto_increment
+                || matches!(
+                    c_lower.as_str(),
+                    "id" | "created_at" | "updated_at" | "created_by" | "updated_by"
+                )
+            {
                 continue;
             }
 
-            let (store_rule, update_rule) = if c_lower.contains("email") {
-                ("required|email", "sometimes|email")
+            let dt = col_info.data_type.to_lowercase();
+            let is_integer = dt.contains("int")
+                || c_lower.ends_with("_id")
+                || c_lower.ends_with("_count")
+                || c_lower.starts_with("count_")
+                || c_lower == "count"
+                || c_lower.contains("qty")
+                || c_lower.contains("stock")
+                || c_lower == "age"
+                || c_lower.ends_with("_age");
+
+            let is_numeric = !is_integer
+                && (dt.contains("decimal")
+                    || dt.contains("numeric")
+                    || dt.contains("float")
+                    || dt.contains("double")
+                    || dt.contains("real")
+                    || c_lower.contains("price")
+                    || c_lower.contains("amount")
+                    || c_lower.contains("cost"));
+
+            let is_boolean = dt.contains("bool")
+                || (dt.contains("tinyint")
+                    && (c_lower.starts_with("is_") || c_lower.starts_with("has_")))
+                || c_lower.starts_with("is_")
+                || c_lower.starts_with("has_");
+
+            let type_rule = if c_lower.contains("email") {
+                "email"
             } else if c_lower.contains("password") {
-                ("required|string|min:8", "sometimes|string|min:8")
-            } else if c_lower.ends_with("_id") || c_lower.contains("count") || c_lower.contains("qty") || c_lower.contains("stock") || c_lower.contains("age") {
-                ("required|integer", "sometimes|integer")
-            } else if c_lower.contains("price") || c_lower.contains("amount") || c_lower.contains("cost") {
-                ("required|numeric", "sometimes|numeric")
+                "string|min:8"
+            } else if is_boolean {
+                "boolean"
+            } else if is_integer {
+                "integer"
+            } else if is_numeric {
+                "numeric"
             } else if c_lower.contains("title") || c_lower.contains("name") {
-                ("required|string|min:2|max:255", "sometimes|string|min:2|max:255")
-            } else if c_lower.contains("slug") {
-                ("sometimes|string", "sometimes|string")
-            } else if c_lower.contains("status") {
-                ("sometimes|string", "sometimes|string")
+                "string|min:2|max:255"
             } else {
-                ("required|string", "sometimes|string")
+                "string"
             };
+
+            let is_optional = col_info.is_nullable
+                || col_info.has_default
+                || c_lower == "slug"
+                || c_lower.ends_with("_slug")
+                || c_lower == "status";
+
+            let store_rule = if is_optional {
+                format!("sometimes|{}", type_rule)
+            } else {
+                format!("required|{}", type_rule)
+            };
+            let update_rule = format!("sometimes|{}", type_rule);
 
             store_rules.push(format!("            (\"{}\", \"{}\"),", col, store_rule));
             update_rules.push(format!("            (\"{}\", \"{}\"),", col, update_rule));
@@ -855,7 +1063,9 @@ DROP TABLE IF EXISTS {table};
                 json!("Secret123!")
             } else if c_lower.contains("price") || c_lower.contains("amount") || c_lower.contains("cost") {
                 json!(99.99)
-            } else if c_lower.contains("qty") || c_lower.contains("stock") || c_lower.contains("count") || c_lower.contains("age") {
+            } else if c_lower.ends_with("_url") || c_lower.contains("image") {
+                json!("https://example.com/sample.jpg")
+            } else if c_lower.contains("qty") || c_lower.contains("stock") || c_lower.contains("count") || c_lower == "age" || c_lower.ends_with("_age") {
                 json!(10)
             } else if c_lower.starts_with("is_") || c_lower.starts_with("has_") {
                 json!(true)
