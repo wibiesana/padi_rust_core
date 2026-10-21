@@ -23,6 +23,27 @@ impl Console {
         }
     }
 
+    fn ask_realtime_prompt(args: &[String]) -> bool {
+        for arg in args {
+            if arg == "--realtime" || arg == "-r" || arg == "--realtime=true" || arg == "--realtime=1" {
+                return true;
+            }
+            if arg == "--no-realtime" || arg == "--realtime=false" || arg == "--realtime=0" {
+                return false;
+            }
+        }
+
+        use std::io::Write;
+        print!("📡 Enable Real-time SSE broadcasting hooks for this CRUD? [y/N]: ");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let trimmed = input.trim().to_lowercase();
+            return trimmed == "y" || trimmed == "yes";
+        }
+        false
+    }
+
     pub async fn run(&self, args: &[String]) -> Result<(), ApiError> {
         let command = args.first().map(|s| s.as_str()).unwrap_or("help");
         let force = args.iter().any(|a| a == "--force");
@@ -32,12 +53,13 @@ impl Console {
             "help" | "list" | "--help" | "-h" => self.show_help(),
 
             "make:controller" | "create:controller" => {
-                let name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
+                let name = args.iter().skip(1).find(|s| !s.starts_with('-')).map(|s| s.as_str());
+                let realtime = args.iter().any(|a| a == "--realtime" || a == "-r" || a == "--realtime=true" || a == "--realtime=1");
                 if let Some(name) = name {
-                    generator.generate_controller(name, force).await?;
+                    generator.with_realtime(realtime).generate_controller(name, force).await?;
                 } else {
                     eprintln!("\x1b[31mError: Controller name is required.\x1b[0m");
-                    println!("Usage: padi make:controller <name>");
+                    println!("Usage: padi make:controller <name> [--realtime / -r] [--force]");
                 }
             }
 
@@ -82,17 +104,21 @@ impl Console {
             }
 
             "generate:crud" | "g" => {
-                let table_name = args.get(1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
+                let table_name = args.iter().skip(1).find(|s| !s.starts_with('-')).map(|s| s.as_str());
                 if let Some(table) = table_name {
+                    let realtime = Self::ask_realtime_prompt(args);
+                    let generator = generator.with_realtime(realtime);
                     generator.generate_crud(table, force).await?;
                 } else {
                     eprintln!("\x1b[31mError: Table name is required.\x1b[0m");
-                    println!("Usage: padi generate:crud <table_name>");
-                    println!("   or: padi g <table_name>");
+                    println!("Usage: padi generate:crud <table_name> [--realtime / -r] [--force]");
+                    println!("   or: padi g <table_name> [--realtime / -r] [--force]");
                 }
             }
 
             "generate:crud-all" | "ga" => {
+                let realtime = Self::ask_realtime_prompt(args);
+                let generator = generator.with_realtime(realtime);
                 generator.generate_crud_all(force).await?;
             }
 
@@ -220,9 +246,9 @@ impl Console {
         println!("  \x1b[32mmigrate:status\x1b[0m              Show migration status");
 
         println!("\n \x1b[33mgenerate\x1b[0m");
-        println!("  \x1b[32mgenerate:crud\x1b[0m <table_name>  Generate complete CRUD (Model, Controller, Resource, Routes)");
+        println!("  \x1b[32mgenerate:crud\x1b[0m <table_name>  Generate complete CRUD (Model, Controller, Resource, Routes) [--realtime, --force]");
         println!("  \x1b[32mg\x1b[0m <table_name>              Alias for generate:crud");
-        println!("  \x1b[32mgenerate:crud-all\x1b[0m           Generate complete CRUD for ALL tables in database");
+        println!("  \x1b[32mgenerate:crud-all\x1b[0m           Generate complete CRUD for ALL tables in database [--realtime, --force]");
         println!("  \x1b[32mga\x1b[0m                         Alias for generate:crud-all");
 
         println!("\n \x1b[33mqueue\x1b[0m");

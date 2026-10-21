@@ -321,7 +321,15 @@ impl SetupWizard {
 
         if crud_choice == 1 {
             let table = self.ask("Enter table name to scaffold", "users");
-            let generator = Generator::new(&self.project_root);
+            let realtime_choice = self.choice(
+                "Enable real-time SSE broadcasting for CRUD?",
+                &[
+                    (1, "No - Standard REST API"),
+                    (2, "Yes - Enable SSE hooks (Realtime::publish)"),
+                ],
+                1,
+            );
+            let generator = Generator::new(&self.project_root).with_realtime(realtime_choice == 2);
             if let Err(e) = generator.generate_crud(&table, false).await {
                 self.error(&format!("CRUD generation error: {}", e));
             } else {

@@ -97,7 +97,6 @@ pub struct QueryLog {
     pub sql: String,
     pub bindings: Vec<Value>,
     pub duration: String,
-    pub duration_ms: f64,
 }
 
 tokio::task_local! {
@@ -185,7 +184,6 @@ impl Database {
                     sql: sql.to_string(),
                     bindings: params.iter().map(Value::from).collect(),
                     duration: format!("{:.2}ms", ms),
-                    duration_ms: ms,
                 });
             }
         });

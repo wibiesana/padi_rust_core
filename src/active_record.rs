@@ -702,8 +702,8 @@ impl Model {
                 "total": total,
                 "per_page": per_page,
                 "current_page": page,
-                "last_page": t.div_ceil(per_page),
-                "from": offset + 1,
+                "last_page": t.div_ceil(per_page).max(1),
+                "from": if total > 0 { offset + 1 } else { 0 },
                 "to": (offset + per_page).min(t),
             }
         }))
@@ -897,9 +897,6 @@ impl Model {
                 if let Some(h) = related.after_load { h(&mut data); }
                 if !nested.is_empty() {
                     related.load_relations(&mut data, &nested).await?;
-                } else if !related.default_with.is_empty() {
-                    let dw = related.get_with();
-                    related.load_relations(&mut data, &dw).await?;
                 }
 
                 // group by key

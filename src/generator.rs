@@ -64,13 +64,21 @@ fn json_get_val<'a>(r: &'a Value, key: &str) -> Option<&'a Value> {
 
 pub struct Generator {
     pub base_dir: PathBuf,
+    pub realtime: bool,
 }
 
 impl Generator {
     pub fn new<P: AsRef<Path>>(base_dir: P) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
+            realtime: false,
         }
+    }
+
+    /// Enable or disable realtime SSE broadcasting in generated controllers.
+    pub fn with_realtime(mut self, enabled: bool) -> Self {
+        self.realtime = enabled;
+        self
     }
 
     /// Check if a table name is in the protected core tables list.
@@ -540,7 +548,7 @@ impl Generator {
         let base_path = self
             .base_dir
             .join("src/models/base")
-            .join(format!("{}_base.rs", singular));
+            .join(format!("{}.rs", singular));
 
         let base_content = if fillable.is_empty() {
             format!(
@@ -589,7 +597,7 @@ pub const BASE_{const_name}: Model = Model::new("{table_name}"){pk_chain}
             );
         } else {
             let concrete_content = format!(
-                r#"pub use super::base::{singular}_base::BASE_{const_name} as {const_name};
+                r#"pub use super::base::{singular}::BASE_{const_name} as {const_name};
 
 // Add custom business logic, custom queries, hooks, and relationships below:
 "#
@@ -781,7 +789,44 @@ impl Resource for {resource_struct} {{
             update_rules.push(format!("            (\"{}\", \"{}\"),", col, update_rule));
         }
 
-        let store_body = if store_rules.is_empty() {
+        let store_body = if self.realtime {
+            if store_rules.is_empty() {
+                format!(
+                    r#"    let item = {const_name}.create(&body).await?;
+    let res = {struct_name}Resource::wrap(&item);
+    Realtime::publish(
+        "{table_name}",
+        json!({{
+            "action": "create",
+            "data": &res,
+        }}),
+    );
+    created(res)"#
+                )
+            } else {
+                let store_rules_str = store_rules.join("\n");
+                format!(
+                    r#"    let data = Validator::new(
+        &body,
+        &[
+{store_rules_str}
+        ],
+    )
+    .validate()
+    .await?;
+    let item = {const_name}.create(&data).await?;
+    let res = {struct_name}Resource::wrap(&item);
+    Realtime::publish(
+        "{table_name}",
+        json!({{
+            "action": "create",
+            "data": &res,
+        }}),
+    );
+    created(res)"#
+                )
+            }
+        } else if store_rules.is_empty() {
             format!(
                 r#"    let item = {const_name}.create(&body).await?;
     created({struct_name}Resource::wrap(&item))"#
@@ -802,7 +847,44 @@ impl Resource for {resource_struct} {{
             )
         };
 
-        let update_body = if update_rules.is_empty() {
+        let update_body = if self.realtime {
+            if update_rules.is_empty() {
+                format!(
+                    r#"    let item = {const_name}.update(id, &body).await?;
+    let res = {struct_name}Resource::wrap(&item);
+    Realtime::publish(
+        "{table_name}",
+        json!({{
+            "action": "update",
+            "data": &res,
+        }}),
+    );
+    ok(res)"#
+                )
+            } else {
+                let update_rules_str = update_rules.join("\n");
+                format!(
+                    r#"    let data = Validator::new(
+        &body,
+        &[
+{update_rules_str}
+        ],
+    )
+    .validate()
+    .await?;
+    let item = {const_name}.update(id, &data).await?;
+    let res = {struct_name}Resource::wrap(&item);
+    Realtime::publish(
+        "{table_name}",
+        json!({{
+            "action": "update",
+            "data": &res,
+        }}),
+    );
+    ok(res)"#
+                )
+            }
+        } else if update_rules.is_empty() {
             format!(
                 r#"    let item = {const_name}.update(id, &body).await?;
     ok({struct_name}Resource::wrap(&item))"#
@@ -823,11 +905,30 @@ impl Resource for {resource_struct} {{
             )
         };
 
+        let destroy_body = if self.realtime {
+            format!(
+                r#"    {const_name}.delete(id).await?;
+    Realtime::publish(
+        "{table_name}",
+        json!({{
+            "action": "delete",
+            "id": id,
+        }}),
+    );
+    no_content()"#
+            )
+        } else {
+            format!(
+                r#"    {const_name}.delete(id).await?;
+    no_content()"#
+            )
+        };
+
         // 1. Tier 1: Base Controller (ALWAYS regenerated/overwritten)
         let base_path = self
             .base_dir
             .join("src/controllers/base")
-            .join(format!("{}_base.rs", plural));
+            .join(format!("{}.rs", plural));
 
         let base_content = format!(
             r#"#![allow(dead_code, unused_imports)]
@@ -860,8 +961,7 @@ pub async fn update(_auth: AuthUser, Path(id): Path<i64>, Body(body): Body) -> A
 }}
 
 pub async fn destroy(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
-    {const_name}.delete(id).await?;
-    no_content()
+{destroy_body}
 }}
 "#
         );
@@ -884,7 +984,7 @@ pub async fn destroy(_auth: AuthUser, Path(id): Path<i64>) -> ApiResult {{
         } else {
             let concrete_content = format!(
                 r#"#[allow(unused_imports)]
-pub use super::base::{plural}_base::*;
+pub use super::base::{plural}::*;
 
 // Add or override custom action handlers below:
 "#
@@ -1557,10 +1657,10 @@ DROP TABLE IF EXISTS {table};
     ) -> Result<(), ApiError> {
         // 1. Ensure `pub mod base;` is declared in src/models/mod.rs
         Self::ensure_mod_rs(&base_dir.join("src/models/mod.rs"), "base", None)?;
-        // 2. Ensure `pub mod <singular>_base;` and re-export in src/models/base/mod.rs
+        // 2. Ensure `pub mod <singular>;` and re-export in src/models/base/mod.rs
         Self::ensure_mod_rs(
             &base_dir.join("src/models/base/mod.rs"),
-            &format!("{}_base", module_name),
+            module_name,
             Some(&format!("BASE_{}", const_name)),
         )?;
         // 3. Ensure `pub mod <singular>;` and re-export in src/models/mod.rs
@@ -1578,10 +1678,10 @@ DROP TABLE IF EXISTS {table};
     fn update_controllers_mod_rs(base_dir: &Path, module_name: &str) -> Result<(), ApiError> {
         // 1. Ensure `pub mod base;` is declared in src/controllers/mod.rs
         Self::ensure_mod_rs(&base_dir.join("src/controllers/mod.rs"), "base", None)?;
-        // 2. Ensure `pub mod <plural>_base;` in src/controllers/base/mod.rs
+        // 2. Ensure `pub mod <plural>;` in src/controllers/base/mod.rs
         Self::ensure_mod_rs(
             &base_dir.join("src/controllers/base/mod.rs"),
-            &format!("{}_base", module_name),
+            module_name,
             None,
         )?;
         // 3. Ensure `pub mod <plural>;` in src/controllers/mod.rs
@@ -1789,5 +1889,13 @@ mod tests {
         assert_eq!(struc, "OrderItem");
         assert_eq!(cnst, "ORDER_ITEMS");
         assert_eq!(plur, "order_items");
+    }
+
+    #[test]
+    fn test_generator_with_realtime() {
+        let gen = Generator::new(".").with_realtime(true);
+        assert!(gen.realtime);
+        let gen2 = Generator::new(".");
+        assert!(!gen2.realtime);
     }
 }
