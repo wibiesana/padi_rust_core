@@ -222,7 +222,7 @@ impl Console {
     }
 
     pub fn show_help(&self) {
-        println!("\x1b[32mPadi Rust Api Framework\x1b[0m version \x1b[33m0.1.0\x1b[0m\n");
+        println!("\x1b[32mPadi Rust Api Framework\x1b[0m version \x1b[33m1.0.0\x1b[0m\n");
         println!("\x1b[33mUsage:\x1b[0m");
         println!("  padi <command> [options] [arguments]");
         println!("  cargo run -- <command> [options] [arguments]\n");
