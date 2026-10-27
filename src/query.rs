@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Query builder version.
-pub const VERSION: &str = "1.0.0";
+pub const VERSION: &str = "1.0.1";
 
 /// Identifiers may contain letters, digits, `_`, `.`, `*` and a single ` as ` alias.
 fn safe_ident(s: &str) -> String {

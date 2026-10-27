@@ -144,7 +144,7 @@ impl Cache {
                 return false;
             }
         }
-        let tmp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+        let tmp = PathBuf::from(format!("{}.tmp.{}.{}", path.display(), std::process::id(), seq()));
         let payload = json!({"key": key, "value": value, "expires": expires}).to_string();
         if fs::write(&tmp, payload).is_err() {
             return false;
@@ -156,6 +156,10 @@ impl Cache {
     fn file_read_entry(key: &str) -> Option<(Value, u64)> {
         let path = file_for(key);
         let raw = fs::read_to_string(&path).ok()?;
+        if raw.trim().is_empty() {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
         let v: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(_) => {
@@ -294,7 +298,13 @@ impl Cache {
             memory().read().ok()?.get(key).filter(|e| !is_expired(e.expires, now())).map(|e| (e.value.clone(), e.expires))
         };
         let (cur, expires) = match current {
-            Some((v, e)) => (v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))?, e),
+            Some((v, e)) => {
+                let n = v
+                    .as_i64()
+                    .or_else(|| v.as_f64().map(|f| f as i64))
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))?;
+                (n, e)
+            }
             None => (0, 0),
         };
         let new = cur + step;
